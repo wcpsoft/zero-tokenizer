@@ -1,0 +1,779 @@
+use std::collections::HashMap as StdHashMap;
+
+use dary_heap::OctonaryHeap;
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+
+use ahash::{AHashMap, AHashSet};
+use compact_str::CompactString;
+use rayon::prelude::*;
+
+use crate::base::traits::{Tokenizer as TokenizerTrait, MergeBasedTokenizer};
+use crate::base::word::Word;
+use crate::base::merge_job::MergeJob;
+use crate::base::tokenizer_base::{TokenizerBase, count_pairs_parallel, GPT4_PATTERN};
+
+/// 词ID类型
+pub type WordId = u32;
+
+/// BPE分词器实现，参考template.rs并结合src/base基础组件
+#[cfg(feature = "python")]
+#[pyclass]
+pub struct Tokenizer {
+    /// 合并规则：(token_a, token_b) -> new_token_id
+    #[pyo3(get, set)]
+    pub merges: StdHashMap<(WordId, WordId), WordId>,
+    /// 基础分词器，用于文本分割和基础功能
+    pub base: TokenizerBase<u32>,
+    /// 词汇表，映射token_id到文本
+    pub vocab: StdHashMap<WordId, String>,
+    /// 下一个可用的token ID
+    pub next_token_id: WordId,
+}
+
+#[cfg(feature = "python")]
+impl Tokenizer {
+    /// 创建新的分词器
+    pub fn new_internal() -> Result<Self, String> {
+        let base = TokenizerBase::new()?;
+        
+        let mut tokenizer = Self {
+            merges: StdHashMap::new(),
+            base,
+            vocab: StdHashMap::new(),
+            next_token_id: 256,
+        };
+        
+        // 初始化词汇表，添加所有字节值
+        for byte in 0u8..=255u8 {
+            // 将字节值转换为对应的字符
+            let byte_char = byte as char;
+            tokenizer.vocab.insert(byte as u32, byte_char.to_string());
+        }
+        
+        Ok(tokenizer)
+    }
+
+    /// 使用自定义正则表达式模式创建新的分词器
+    pub fn with_pattern_internal(pattern: String) -> Result<Self, String> {
+        let base = TokenizerBase::with_pattern(pattern)?;
+        
+        let mut tokenizer = Self {
+            merges: StdHashMap::new(),
+            base,
+            vocab: StdHashMap::new(),
+            next_token_id: 256,
+        };
+        
+        // 初始化词汇表，添加所有字节值
+        for byte in 0u8..=255u8 {
+            // 将字节值转换为对应的字符
+            let byte_char = byte as char;
+            tokenizer.vocab.insert(byte as u32, byte_char.to_string());
+        }
+        
+        Ok(tokenizer)
+    }
+
+    /// 从常用汉字字表文件加载基础字符
+    pub fn load_base_chars(&mut self, file_path: &str) -> Result<(), std::io::Error> {
+        use std::fs::File;
+        use std::io::{self, BufRead};
+        
+        let file = File::open(file_path)?;
+        let reader = io::BufReader::new(file);
+        
+        // 清除现有词汇表中256以上的条目
+        self.vocab.retain(|&k, _| k < 256);
+        self.next_token_id = 256;
+        
+        for line in reader.lines() {
+            let line = line?;
+            let char_str = line.trim();
+            if !char_str.is_empty() {
+                self.vocab.insert(self.next_token_id, char_str.to_string());
+                self.next_token_id += 1;
+            }
+        }
+        
+        log::info!("已加载 {} 个基础字符", self.vocab.len() - 256);
+        Ok(())
+    }
+
+    /// 获取合并等级映射
+    pub fn get_mergeable_ranks_internal(&self) -> StdHashMap<(WordId, WordId), u32> {
+        let mut ranks = StdHashMap::new();
+        
+        // 首先添加基础字符的映射（0-255）
+        for i in 0..256u32 {
+            ranks.insert((i, 0), i);
+        }
+        
+        // 然后添加合并规则的映射
+        for (pair, &new_id) in &self.merges {
+            ranks.insert(pair.clone(), new_id);
+        }
+        
+        ranks
+    }
+
+    /// 应用合并规则到标记序列
+    pub fn apply_merges(&mut self, tokens: &mut Vec<u32>) -> Result<(), String> {
+        // 创建Word并应用合并规则
+        let mut word = Word::new(tokens.clone());
+        
+        // 持续应用合并规则，直到没有更多可能的合并
+        let mut changed = true;
+        while changed {
+            changed = false;
+            
+            // 查找可以合并的词对
+            for (pair, &new_id) in &self.merges {
+                let mut i = 0;
+                while i < word.ids().len() - 1 {
+                    if word.ids()[i] == pair.0 && word.ids()[i + 1] == pair.1 {
+                        // 执行合并
+                        word.merge_pair(
+                            pair.clone(),
+                            new_id,
+                            |a, b| a == b,
+                        );
+                        changed = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                
+                if changed {
+                    break;
+                }
+            }
+        }
+        
+        // 更新tokens为合并后的结果
+        *tokens = word.ids().to_vec();
+        
+        Ok(())
+    }
+
+    /// 给定唯一词的核心增量BPE训练
+    fn train_core_incremental(&mut self, mut words: Vec<Word<WordId>>, vocab_size: u32) {
+        // 确保词汇表大小不小于基础字符数量
+        let vocab_size = vocab_size.max(256);
+        let num_merges = vocab_size - 256;
+        log::info!("开始增量BPE训练: 需要计算 {} 次合并", num_merges);
+        self.merges.clear();
+
+        // ---- 初始配对计数和更新位置（并行） ----
+        log::info!("从 {} 个唯一序列计算初始配对计数", words.len());
+        let counts: Vec<i32> = vec![1; words.len()]; // 每个词的初始计数为1
+        let (mut pair_counts, mut where_to_update) = count_pairs_parallel(&words, &counts);
+
+        // ---- 构建堆 ----
+        log::info!("使用 {} 个唯一配对构建堆", pair_counts.len());
+        let mut heap = OctonaryHeap::with_capacity(pair_counts.len());
+        for (pair, pos) in where_to_update.drain() {
+            let c = *pair_counts.get(&pair).unwrap_or(&0);
+            if c > 0 {
+                let mut merge_job = MergeJob::new(pair, c as u64);
+                merge_job.add_positions(&pos);
+                heap.push(merge_job);
+            }
+        }
+
+        // ---- 合并循环 ----
+        log::info!("开始合并循环");
+        let mut merges_done = 0u32;
+        let mut last_log_percent = 0u32;
+
+        while merges_done < num_merges {
+            let Some(top) = heap.pop() else { 
+                // 如果没有更多的配对可以合并，但还需要更多token，添加随机token
+                log::info!("没有更多配对可合并，添加随机token以达到目标词汇表大小");
+                while self.next_token_id < vocab_size {
+                    // 创建一个随机的1-4字节序列
+                    let len = (rand::random::<u8>() % 4) + 1;
+                    let mut random_bytes = Vec::new();
+                    for _ in 0..len {
+                        random_bytes.push(rand::random::<u8>());
+                    }
+                    
+                    // 将字节序列转换为字符串
+                    let random_str = String::from_utf8_lossy(&random_bytes).to_string();
+                    self.vocab.insert(self.next_token_id, random_str);
+                    self.next_token_id += 1;
+                }
+                break;
+            };
+
+            // 如果此配对不再有效（由于之前的合并），跳过它
+            if let Some(&current_count) = pair_counts.get(&top.pair) {
+                if current_count as u64 != top.count {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+
+            // 执行合并
+            let new_id = self.next_token_id;
+            self.next_token_id += 1;
+            self.merges.insert(top.pair.clone(), new_id);
+
+            // 更新词汇表
+            if let (Some(a_text), Some(b_text)) = (self.vocab.get(&top.pair.0), self.vocab.get(&top.pair.1)) {
+                let merged_text = format!("{}{}", a_text, b_text);
+                self.vocab.insert(new_id, merged_text);
+            }
+
+            // 更新受影响的词
+            let mut updated_pairs: AHashMap<(WordId, WordId), i32> = AHashMap::new();
+            let mut updated_where: AHashMap<(WordId, WordId), AHashSet<usize>> = AHashMap::new();
+
+            for &word_idx in &top.pos {
+                let deltas = words[word_idx].merge_pair(
+                    top.pair.clone(),
+                    new_id,
+                    |a, b| a == b,
+                );
+                for (pair, delta) in deltas {
+                    *updated_pairs.entry(pair.clone()).or_insert(0) += delta;
+                    updated_where.entry(pair).or_default().insert(word_idx);
+                }
+            }
+
+            // 更新全局计数
+            for (pair, delta) in updated_pairs {
+                let entry = pair_counts.entry(pair.clone()).or_insert(0);
+                *entry += delta;
+                
+                if *entry <= 0 {
+                    pair_counts.remove(&pair);
+                } else if let Some(pos_set) = updated_where.get(&pair) {
+                    let mut merge_job = MergeJob::new(pair, *entry as u64);
+                    merge_job.add_positions(&pos_set.iter().cloned().collect::<Vec<_>>());
+                    heap.push(merge_job);
+                }
+            }
+
+            merges_done += 1;
+            
+            // 每10%记录一次进度
+            let percent = merges_done * 100 / num_merges;
+            if percent > last_log_percent {
+                log::info!("训练进度: {}% ({} 次合并)", percent, merges_done);
+                last_log_percent = percent;
+            }
+        }
+        
+        // 确保词汇表大小达到目标值
+        while self.next_token_id < vocab_size {
+            // 创建一个随机的1-4字节序列
+            let len = (rand::random::<u8>() % 4) + 1;
+            let mut random_bytes = Vec::new();
+            for _ in 0..len {
+                random_bytes.push(rand::random::<u8>());
+            }
+            
+            // 将字节序列转换为字符串
+            let random_str = String::from_utf8_lossy(&random_bytes).to_string();
+            self.vocab.insert(self.next_token_id, random_str);
+            self.next_token_id += 1;
+        }
+        
+        log::info!("训练完成，词汇表大小: {}, next_token_id: {}", self.vocab.len(), self.next_token_id);
+    }
+}
+
+#[cfg(feature = "python")]
+impl Default for Tokenizer {
+    fn default() -> Self {
+        Self::new_internal().unwrap()
+    }
+}
+
+/// 公共方法，将暴露给Python的Tokenizer类。
+#[cfg(feature = "python")]
+#[pymethods]
+impl Tokenizer {
+    /// 创建一个新的Tokenizer
+    #[new]
+    pub fn new() -> PyResult<Self> {
+        Self::new_internal()
+            .map_err(|e| PyValueError::new_err(format!("创建分词器失败: {}", e)))
+    }
+
+    /// 使用自定义正则表达式模式创建新的分词器
+    #[staticmethod]
+    pub fn with_pattern(pattern: String) -> PyResult<Self> {
+        Self::with_pattern_internal(pattern)
+            .map_err(|e| PyValueError::new_err(format!("创建分词器失败: {}", e)))
+    }
+
+    /// 从常用汉字字表文件加载基础字符
+    #[pyo3(name = "load_base_chars_bpe")]
+    pub fn py_load_base_chars(&mut self, file_path: String) -> PyResult<()> {
+        self.load_base_chars(&file_path)
+            .map_err(|e| PyValueError::new_err(format!("加载基础字符失败: {}", e)))
+    }
+
+    /// 从Python迭代器训练分词器
+    #[cfg(feature = "python")]
+    #[pyo3(name = "train_from_iterator")]
+    pub fn py_train_from_iterator(&mut self, texts: Vec<String>, vocab_size: u32) -> PyResult<()> {
+        self.train(texts, vocab_size)
+            .map_err(|e| PyValueError::new_err(format!("训练失败: {}", e)))
+    }
+
+    /// 从流式迭代器训练（并行摄取）
+    #[cfg(feature = "python")]
+    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None))]
+    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None)")]
+    #[pyo3(name = "train_from_iterator_stream")]
+    pub fn train_from_iterator(
+        &mut self,
+        py: pyo3::Python<'_>,
+        iterator: &pyo3::Bound<'_, pyo3::PyAny>,
+        vocab_size: u32,
+        buffer_size: usize,
+        pattern: Option<String>,
+    ) -> PyResult<()> {
+        // 使用提供的模式或默认为GPT-4模式
+        let pattern_str = pattern.unwrap_or_else(|| GPT4_PATTERN.to_string());
+
+        // 更新存储的模式并编译它
+        self.base.pattern = pattern_str.clone();
+        self.base.compiled_pattern = fancy_regex::Regex::new(&pattern_str)
+            .map_err(|e| PyValueError::new_err(format!("无效的正则表达式: {}", e)))?;
+
+        // 准备一个真正的Python迭代器对象
+        let py_iter: pyo3::Py<pyo3::PyAny> = unsafe {
+            pyo3::Bound::from_borrowed_ptr_or_err(py, pyo3::ffi::PyObject_GetIter(iterator.as_ptr()))?
+                .into()
+        };
+
+        // 全局块计数
+        let mut counts: AHashMap<CompactString, i32> = AHashMap::new();
+
+        // 临时缓冲区，我们在GIL下填充它
+        let mut buf: Vec<String> = Vec::with_capacity(buffer_size);
+
+        log::info!("Processing sequences from iterator (buffer_size: {})", buffer_size);
+        let mut total_sequences = 0u64;
+
+        // 辅助函数：在`buf`中填充最多`buffer_size`个字符串来自Python迭代器
+        let refill = |buf: &mut Vec<String>| -> PyResult<bool> {
+            pyo3::Python::with_gil(|py| {
+                buf.clear();
+                let it = py_iter.bind(py);
+                loop {
+                    if buf.len() >= buffer_size {
+                        return Ok(false);
+                    }
+                    // next(it)
+                    let next_obj = unsafe {
+                        pyo3::Bound::from_owned_ptr_or_opt(py, pyo3::ffi::PyIter_Next(it.as_ptr()))
+                    };
+                    match next_obj {
+                        Some(obj) => {
+                            let s: String = obj.extract()?;
+                            buf.push(s);
+                        }
+                        None => {
+                            if pyo3::PyErr::occurred(py) {
+                                return Err(pyo3::PyErr::fetch(py));
+                            } else {
+                                return Ok(true); // exhausted
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        // 流摄取循环：在GIL下填充，在GIL外处理（并行）
+        loop {
+            let exhausted = refill(&mut buf)?;
+            if buf.is_empty() && exhausted {
+                break;
+            }
+
+            total_sequences += buf.len() as u64;
+
+            let pattern = self.base.compiled_pattern.clone();
+            let local: AHashMap<CompactString, i32> = py.allow_threads(|| {
+                buf.par_iter()
+                    .map(|s| {
+                        let mut m: AHashMap<CompactString, i32> = AHashMap::new();
+                        for mat in pattern.find_iter(s) {
+                            let piece = match mat {
+                                Ok(m) => m.as_str(),
+                                Err(_) => continue,
+                            };
+                            *m.entry(CompactString::from(piece)).or_default() += 1;
+                        }
+                        m
+                    })
+                    .reduce(
+                        || AHashMap::new(),
+                        |mut a, b| {
+                            for (k, v) in b {
+                                *a.entry(k).or_default() += v;
+                            }
+                            a
+                        },
+                    )
+            });
+
+            // 合并局部到全局（单线程）
+            for (k, v) in local {
+                *counts.entry(k).or_default() += v;
+            }
+
+            if exhausted {
+                break;
+            }
+        }
+        log::info!("Processed {} sequences total, {} unique", total_sequences, counts.len());
+
+        // 物化词和计数
+        let mut words = Vec::with_capacity(counts.len());
+        let mut cvec = Vec::with_capacity(counts.len());
+        for (chunk, c) in counts.into_iter() {
+            // 将文本分割为字符序列
+            let mut ids = Vec::new();
+            for ch in chunk.chars() {
+                // 直接使用字节值
+                for byte in ch.to_string().as_bytes() {
+                    ids.push(*byte as WordId);
+                }
+            }
+            
+            words.push(Word::new(ids));
+            cvec.push(c);
+        }
+
+        self.train_core_incremental(words, vocab_size);
+        Ok(())
+    }
+
+    /// 返回正则表达式模式
+    #[cfg(feature = "python")]
+    #[pyo3(text_signature = "(self)")]
+    pub fn get_pattern(&self) -> String {
+        self.base.pattern.clone()
+    }
+
+    /// 获取合并等级映射
+    #[cfg(feature = "python")]
+    #[pyo3(name = "get_mergeable_ranks")]
+    pub fn py_get_mergeable_ranks(&self) -> StdHashMap<(WordId, WordId), u32> {
+        self.get_mergeable_ranks_internal()
+    }
+    
+    /// 获取词汇表大小
+    #[cfg(feature = "python")]
+    pub fn vocab_size(&self) -> usize {
+        self.vocab.len()
+    }
+    
+    /// 获取词汇表
+    #[cfg(feature = "python")]
+    pub fn get_vocab(&self) -> StdHashMap<WordId, String> {
+        self.vocab.clone()
+    }
+
+    /// 将文本编码为token IDs
+    #[cfg(feature = "python")]
+    #[pyo3(text_signature = "(self, text)")]
+    pub fn py_encode(&self, text: &str) -> Vec<u32> {
+        self.encode(text).unwrap_or_else(|e| {
+            log::error!("编码失败: {}", e);
+            Vec::new()
+        })
+    }
+
+    /// 将token IDs解码为文本
+    #[cfg(feature = "python")]
+    #[pyo3(text_signature = "(self, tokens)")]
+    pub fn py_decode(&self, tokens: Vec<u32>) -> String {
+        self.decode(&tokens).unwrap_or_else(|e| {
+            log::error!("解码失败: {}", e);
+            format!("[解码错误: {}]", e)
+        })
+    }
+}
+
+#[cfg(feature = "python")]
+impl TokenizerTrait for Tokenizer {
+    type TokenId = u32;
+    
+    /// 编码文本为token ID序列，参考template.rs中的实现
+    fn encode(&self, text: &str) -> Result<Vec<Self::TokenId>, String> {
+        // 使用正则表达式分割文本
+        let parts = self.base.split_text(text)?;
+        
+        let mut result = Vec::new();
+        
+        for part in parts {
+            if part.is_empty() {
+                continue;
+            }
+            
+            // 将文本转换为字节序列
+            let bytes = part.as_bytes();
+            let mut ids: Vec<WordId> = bytes.iter().map(|&b| b as WordId).collect();
+            
+            // 应用合并规则
+            let mut changed = true;
+            while changed {
+                changed = false;
+                let mut new_ids = Vec::new();
+                let mut i = 0;
+                
+                while i < ids.len() {
+                    if i + 1 < ids.len() {
+                        // 检查当前ID对是否可以合并
+                        if let Some(&new_id) = self.merges.get(&(ids[i], ids[i+1])) {
+                            new_ids.push(new_id);
+                            i += 2;
+                            changed = true;
+                        } else {
+                            new_ids.push(ids[i]);
+                            i += 1;
+                        }
+                    } else {
+                        new_ids.push(ids[i]);
+                        i += 1;
+                    }
+                }
+                
+                ids = new_ids;
+            }
+            
+            result.extend(ids);
+        }
+        
+        Ok(result)
+    }
+    
+    /// 解码token ID序列为文本，参考template.rs中的实现
+    fn decode(&self, tokens: &[WordId]) -> Result<String, String> {
+        let mut result = String::new();
+        
+        for &token in tokens {
+            if let Some(text) = self.vocab.get(&token) {
+                result.push_str(text);
+            } else {
+                // 如果找不到对应的词汇，尝试作为字节处理
+                if token < 256 {
+                    // 对于字节值，直接转换为字符
+                    result.push(token as u8 as char);
+                } else {
+                    // 对于大于255的token，使用替换字符
+                    result.push('�');
+                }
+            }
+        }
+        
+        Ok(result)
+    }
+    
+    /// 训练分词器，参考template.rs中的实现
+    fn train(&mut self, texts: Vec<String>, vocab_size: u32) -> Result<(), String> {
+        log::info!("开始BPE训练，目标词汇表大小: {}", vocab_size);
+        
+        // 确保词汇表大小不小于256
+        let vocab_size = vocab_size.max(256);
+        
+        // 初始化合并规则
+        self.merges.clear();
+        
+        // 将文本转换为词序列
+        log::info!("处理 {} 个文本样本", texts.len());
+        let words: Vec<Word<WordId>> = {
+            let mut words = Vec::new();
+            
+            for text in &texts {
+                // 使用正则表达式分割文本
+                let parts = self.base.split_text(text)?;
+                
+                for part in parts {
+                    if part.is_empty() {
+                        continue;
+                    }
+                    
+                    // 将每个部分转换为字节序列
+                    let bytes = part.as_bytes();
+                    let ids: Vec<WordId> = bytes.iter().map(|&b| b as WordId).collect();
+                    
+                    if !ids.is_empty() {
+                        words.push(Word::new(ids));
+                    }
+                }
+            }
+            words
+        };
+        
+        log::info!("已处理 {} 个词", words.len());
+        
+        // 使用增量训练核心
+        self.train_core_incremental(words, vocab_size);
+        log::info!("BPE训练完成，最终合并规则数: {}", self.merges.len());
+        log::info!("训练后词汇表大小: {}, next_token_id: {}", self.vocab.len(), self.next_token_id);
+        
+        Ok(())
+    }
+    
+    fn vocab_size(&self) -> usize {
+        log::debug!("词汇表大小: {}, next_token_id: {}", self.vocab.len(), self.next_token_id);
+        self.vocab.len()
+    }
+    
+    fn save(&self, path: &str) -> Result<(), String> {
+        // 使用基础分词器的保存方法
+        self.base.save(path)?;
+        
+        // 保存BPE特定的数据
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        
+        let mut file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("打开文件失败: {}", e))?;
+        
+        // 保存词汇表
+        writeln!(file, "vocab: {}", self.vocab.len())
+            .map_err(|e| format!("写入词汇表大小失败: {}", e))?;
+        
+        for (&id, text) in &self.vocab {
+            writeln!(file, "vocab_entry: {} {}", id, text)
+                .map_err(|e| format!("写入词汇表条目失败: {}", e))?;
+        }
+        
+        // 保存合并规则
+        writeln!(file, "merges: {}", self.merges.len())
+            .map_err(|e| format!("写入合并规则数量失败: {}", e))?;
+        
+        for ((a, b), &new_id) in &self.merges {
+            writeln!(file, "merge: {} {} {}", a, b, new_id)
+                .map_err(|e| format!("写入合并规则失败: {}", e))?;
+        }
+        
+        // 保存下一个可用的token ID
+        writeln!(file, "next_token_id: {}", self.next_token_id)
+            .map_err(|e| format!("写入下一个token ID失败: {}", e))?;
+        
+        Ok(())
+    }
+    
+    fn load(&mut self, path: &str) -> Result<(), String> {
+        // 使用基础分词器的加载方法
+        self.base.load(path)?;
+        
+        // 加载BPE特定的数据
+        use std::fs::File;
+        use std::io::{self, BufRead};
+        
+        let file = File::open(path)
+            .map_err(|e| format!("打开文件失败: {}", e))?;
+        let reader = io::BufReader::new(file);
+        
+        let lines = reader.lines();
+        let mut in_vocab = false;
+        let mut in_merges = false;
+        
+        // 清空当前数据
+        self.vocab.clear();
+        self.merges.clear();
+        
+        for line in lines {
+            let line = line.map_err(|e| format!("读取行失败: {}", e))?;
+            let line = line.trim();
+            
+            if line.starts_with("vocab: ") {
+                in_vocab = true;
+                continue;
+            } else if line.starts_with("merges: ") {
+                in_vocab = false;
+                in_merges = true;
+                continue;
+            } else if line.starts_with("next_token_id: ") {
+                let id_str = line[14..].trim();
+                self.next_token_id = id_str.parse::<WordId>()
+                    .map_err(|e| format!("解析下一个token ID失败: {}", e))?;
+            } else if line.starts_with("vocab_entry: ") {
+                if in_vocab {
+                    let parts: Vec<&str> = line[12..].splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        let id = parts[0].parse::<WordId>()
+                            .map_err(|e| format!("解析词汇表ID失败: {}", e))?;
+                        let text = parts[1].to_string();
+                        self.vocab.insert(id, text);
+                    }
+                }
+            } else if line.starts_with("merge: ") {
+                if in_merges {
+                    let parts: Vec<&str> = line[6..].split_whitespace().collect();
+                    if parts.len() == 3 {
+                        let a = parts[0].parse::<WordId>()
+                            .map_err(|e| format!("解析合并规则a失败: {}", e))?;
+                        let b = parts[1].parse::<WordId>()
+                            .map_err(|e| format!("解析合并规则b失败: {}", e))?;
+                        let new_id = parts[2].parse::<WordId>()
+                            .map_err(|e| format!("解析合并规则new_id失败: {}", e))?;
+                        self.merges.insert((a, b), new_id);
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+#[cfg(feature = "python")]
+impl MergeBasedTokenizer for Tokenizer {
+    fn apply_merges(&mut self, tokens: &mut Vec<Self::TokenId>) -> Result<(), String> {
+        // 应用合并规则，直到没有更多合并可以应用
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut new_tokens = Vec::new();
+            let mut i = 0;
+            
+            while i < tokens.len() {
+                if i + 1 < tokens.len() {
+                    // 检查当前token对是否可以合并
+                    if let Some(&new_id) = self.merges.get(&(tokens[i], tokens[i+1])) {
+                        new_tokens.push(new_id);
+                        i += 2;
+                        changed = true;
+                    } else {
+                        new_tokens.push(tokens[i]);
+                        i += 1;
+                    }
+                } else {
+                    new_tokens.push(tokens[i]);
+                    i += 1;
+                }
+            }
+            
+            *tokens = new_tokens;
+        }
+        
+        Ok(())
+    }
+    
+    fn get_merges(&self) -> &StdHashMap<(Self::TokenId, Self::TokenId), Self::TokenId> {
+        &self.merges
+    }
+    
+    fn set_merges(&mut self, merges: StdHashMap<(Self::TokenId, Self::TokenId), Self::TokenId>) {
+        self.merges = merges;
+    }
+}

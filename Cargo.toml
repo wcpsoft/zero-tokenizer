@@ -1,0 +1,26 @@
+[package]
+name = "zero_tokenizer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dary_heap = "0.3"
+indexmap = "2.2"
+fancy-regex = "0.16.1"
+log = "0.4.28"
+pyo3 = { version = "0.23.3", features = ["extension-module", "abi3"], optional = true }
+pyo3-log = { version = "0.12.4", optional = true }
+ahash = "0.8.12"
+rayon = "1.11.0"
+compact_str = "0.9.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+
+[features]
+default = ["python"]
+python = ["pyo3", "pyo3-log"]
+
+[lib]
+name = "zero_tokenizer"
+crate-type = ["rlib"]
