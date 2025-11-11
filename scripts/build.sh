@@ -19,16 +19,8 @@ if [ -d ".venv" ]; then
     source .venv/bin/activate
 fi
 
-# 编译Rust库
-echo "编译Rust库..."
-cargo build --release
-
-# 使用maturin构建Python扩展
+# 使用maturin构建Python扩展（这会自动编译Rust代码）
 echo "构建Python扩展..."
-if command -v uv &> /dev/null; then
-    uv run maturin develop
-else
-    maturin develop
-fi
+maturin develop
 
 echo "编译完成！"

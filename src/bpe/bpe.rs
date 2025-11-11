@@ -36,49 +36,49 @@ pub struct Tokenizer {
 #[cfg(feature = "python")]
 impl Tokenizer {
     /// 创建新的分词器
-    pub fn new_internal() -> Result<Self, String> {
+    pub fn _new_internal() -> Result<Self, String> {
         let base = TokenizerBase::new()?;
         
         let mut tokenizer = Self {
             merges: StdHashMap::new(),
             base,
             vocab: StdHashMap::new(),
-            next_token_id: 256,
+            next_token_id: 0x110000, // 超出Unicode码点范围的值
         };
         
-        // 初始化词汇表，添加所有字节值
-        for byte in 0u8..=255u8 {
-            // 将字节值转换为对应的字符
-            let byte_char = byte as char;
-            tokenizer.vocab.insert(byte as u32, byte_char.to_string());
+        // 初始化词汇表，添加所有可能的Unicode字符
+        for code_point in 0..=0x10FFFF {
+            if let Some(ch) = char::from_u32(code_point) {
+                tokenizer.vocab.insert(code_point, ch.to_string());
+            }
         }
         
         Ok(tokenizer)
     }
 
     /// 使用自定义正则表达式模式创建新的分词器
-    pub fn with_pattern_internal(pattern: String) -> Result<Self, String> {
+    pub fn _with_pattern_internal(pattern: String) -> Result<Self, String> {
         let base = TokenizerBase::with_pattern(pattern)?;
         
         let mut tokenizer = Self {
             merges: StdHashMap::new(),
             base,
             vocab: StdHashMap::new(),
-            next_token_id: 256,
+            next_token_id: 0x110000, // 超出Unicode码点范围的值
         };
         
-        // 初始化词汇表，添加所有字节值
-        for byte in 0u8..=255u8 {
-            // 将字节值转换为对应的字符
-            let byte_char = byte as char;
-            tokenizer.vocab.insert(byte as u32, byte_char.to_string());
+        // 初始化词汇表，添加所有可能的Unicode字符
+        for code_point in 0..=0x10FFFF {
+            if let Some(ch) = char::from_u32(code_point) {
+                tokenizer.vocab.insert(code_point, ch.to_string());
+            }
         }
         
         Ok(tokenizer)
     }
 
     /// 从常用汉字字表文件加载基础字符
-    pub fn load_base_chars(&mut self, file_path: &str) -> Result<(), std::io::Error> {
+    pub fn _load_base_chars(&mut self, file_path: &str) -> Result<(), std::io::Error> {
         use std::fs::File;
         use std::io::{self, BufRead};
         
@@ -101,9 +101,39 @@ impl Tokenizer {
         log::info!("已加载 {} 个基础字符", self.vocab.len() - 256);
         Ok(())
     }
+    
+    /// 从dict目录加载初始化词表
+    pub fn _load_vocab_from_dict(&mut self, dict_file: &str) -> Result<(), String> {
+        use std::fs::File;
+        use std::io::{self, BufRead};
+        
+        let dict_path = format!("dict/{}", dict_file);
+        let file = File::open(&dict_path)
+            .map_err(|e| format!("打开词表文件 {} 失败: {}", dict_path, e))?;
+        let reader = io::BufReader::new(file);
+        
+        // 清除现有词汇表中256以上的条目
+        self.vocab.retain(|&k, _| k < 256);
+        self.next_token_id = 256;
+        
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("读取行失败: {}", e))?;
+            let token = line.trim();
+            if token.is_empty() {
+                continue;
+            }
+            
+            // 添加新词汇到词汇表
+            self.vocab.insert(self.next_token_id, token.to_string());
+            self.next_token_id += 1;
+        }
+        
+        log::info!("已从 {} 加载 {} 个词汇", dict_file, self.vocab.len() - 256);
+        Ok(())
+    }
 
     /// 获取合并等级映射
-    pub fn get_mergeable_ranks_internal(&self) -> StdHashMap<(WordId, WordId), u32> {
+    pub fn _get_mergeable_ranks_internal(&self) -> StdHashMap<(WordId, WordId), u32> {
         let mut ranks = StdHashMap::new();
         
         // 首先添加基础字符的映射（0-255）
@@ -120,7 +150,7 @@ impl Tokenizer {
     }
 
     /// 应用合并规则到标记序列
-    pub fn apply_merges(&mut self, tokens: &mut Vec<u32>) -> Result<(), String> {
+    pub fn _apply_merges(&mut self, tokens: &mut Vec<u32>) -> Result<(), String> {
         // 创建Word并应用合并规则
         let mut word = Word::new(tokens.clone());
         
@@ -159,10 +189,10 @@ impl Tokenizer {
     }
 
     /// 给定唯一词的核心增量BPE训练
-    fn train_core_incremental(&mut self, mut words: Vec<Word<WordId>>, vocab_size: u32) {
+    fn _train_core_incremental(&mut self, mut words: Vec<Word<WordId>>, vocab_size: u32) {
         // 确保词汇表大小不小于基础字符数量
-        let vocab_size = vocab_size.max(256);
-        let num_merges = vocab_size - 256;
+        let vocab_size = vocab_size.max(0x110000);
+        let num_merges = vocab_size - 0x110000;
         log::info!("开始增量BPE训练: 需要计算 {} 次合并", num_merges);
         self.merges.clear();
 
@@ -224,6 +254,7 @@ impl Tokenizer {
 
             // 更新词汇表
             if let (Some(a_text), Some(b_text)) = (self.vocab.get(&top.pair.0), self.vocab.get(&top.pair.1)) {
+                // 直接合并文本，不进行字节转换
                 let merged_text = format!("{}{}", a_text, b_text);
                 self.vocab.insert(new_id, merged_text);
             }
@@ -288,35 +319,93 @@ impl Tokenizer {
 }
 
 #[cfg(feature = "python")]
-impl Default for Tokenizer {
-    fn default() -> Self {
-        Self::new_internal().unwrap()
-    }
-}
-
-/// 公共方法，将暴露给Python的Tokenizer类。
-#[cfg(feature = "python")]
 #[pymethods]
 impl Tokenizer {
-    /// 创建一个新的Tokenizer
+    /// 创建新的BPE分词器
     #[new]
     pub fn new() -> PyResult<Self> {
-        Self::new_internal()
-            .map_err(|e| PyValueError::new_err(format!("创建分词器失败: {}", e)))
+        Self::_new_internal().map_err(|e| PyValueError::new_err(e))
     }
-
-    /// 使用自定义正则表达式模式创建新的分词器
+    
+    /// 使用自定义正则表达式模式创建新的BPE分词器
     #[staticmethod]
     pub fn with_pattern(pattern: String) -> PyResult<Self> {
-        Self::with_pattern_internal(pattern)
-            .map_err(|e| PyValueError::new_err(format!("创建分词器失败: {}", e)))
+        let mut tokenizer = Self::_new_internal().map_err(|e| PyValueError::new_err(e))?;
+        tokenizer.base.pattern = pattern.clone();
+        tokenizer.base.compiled_pattern = fancy_regex::Regex::new(&pattern)
+            .map_err(|e| PyValueError::new_err(format!("无效的正则表达式: {}", e)))?;
+        Ok(tokenizer)
     }
-
+    
+    /// 编码文本为token IDs
+    pub fn encode(&self, text: &str) -> PyResult<Vec<u32>> {
+        // 实际的编码实现
+        self._encode_internal(text)
+            .map_err(|e| crate::error::TokenizerError::EncodingError { message: e.to_string() }.into())
+    }
+    
+    /// 解码token IDs为文本
+    pub fn decode(&self, tokens: Vec<u32>) -> PyResult<String> {
+        // 实际的解码实现
+        self.decode_internal(tokens)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+    
+    /// 训练分词器
+    pub fn train(&mut self, texts: Vec<String>, vocab_size: u32) -> PyResult<()> {
+        TokenizerTrait::train(self, texts, vocab_size).map_err(|e| PyValueError::new_err(e))
+    }
+    
+    /// 获取词汇表大小
+    pub fn get_vocab_size(&self) -> usize {
+        self._vocab_size()
+    }
+    
+    /// 获取词汇表
+    pub fn get_vocab(&self) -> std::collections::HashMap<u32, String> {
+        // 转换词汇表类型
+        self.vocab.iter().map(|(&k, v)| (k, v.clone())).collect()
+    }
+    
+    /// 获取正则表达式模式
+    pub fn get_pattern(&self) -> String {
+        self.base.pattern.clone()
+    }
+    
+    /// 获取合并等级映射
+    pub fn get_mergeable_ranks(&self) -> std::collections::HashMap<(u32, u32), u32> {
+        // 转换合并等级映射类型
+        self._get_mergeable_ranks_internal().into_iter().map(|((a, b), c)| ((a, b), c)).collect()
+    }
+    
+    /// 保存分词器
+    pub fn save(&self, path: &str) -> PyResult<()> {
+        TokenizerTrait::save(self, path)
+            .map_err(|e| crate::error::TokenizerError::ModelSaveError { message: e }.into())
+    }
+    
+    /// 加载分词器
+    pub fn load(&mut self, path: &str) -> PyResult<()> {
+        TokenizerTrait::load(self, path).map_err(|e| PyValueError::new_err(e))
+    }
+    
+    /// 从常用汉字字表文件加载基础字符
+    pub fn load_base_chars(&mut self, file_path: &str) -> PyResult<()> {
+        self._load_base_chars(file_path).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+    
     /// 从常用汉字字表文件加载基础字符
     #[pyo3(name = "load_base_chars_bpe")]
     pub fn py_load_base_chars(&mut self, file_path: String) -> PyResult<()> {
-        self.load_base_chars(&file_path)
-            .map_err(|e| PyValueError::new_err(format!("加载基础字符失败: {}", e)))
+        self._load_base_chars(&file_path)
+            .map_err(|e| crate::error::TokenizerError::IoError { source: e }.into())
+    }
+    
+    /// 从dict目录加载初始化词表
+    #[pyo3(name = "load_vocab_from_dict")]
+    pub fn py_load_vocab_from_dict(&mut self, dict_file: String) -> PyResult<()> {
+        self._load_vocab_from_dict(&dict_file)
+            .map_err(|e| crate::error::TokenizerError::LoadError { message: e }.into())
     }
 
     /// 从Python迭代器训练分词器
@@ -346,11 +435,12 @@ impl Tokenizer {
         // 更新存储的模式并编译它
         self.base.pattern = pattern_str.clone();
         self.base.compiled_pattern = fancy_regex::Regex::new(&pattern_str)
-            .map_err(|e| PyValueError::new_err(format!("无效的正则表达式: {}", e)))?;
+            .map_err(|e| crate::error::TokenizerError::InvalidRegex { message: e.to_string() })?;
 
         // 准备一个真正的Python迭代器对象
         let py_iter: pyo3::Py<pyo3::PyAny> = unsafe {
-            pyo3::Bound::from_borrowed_ptr_or_err(py, pyo3::ffi::PyObject_GetIter(iterator.as_ptr()))?
+            pyo3::Bound::from_borrowed_ptr_or_err(py, pyo3::ffi::PyObject_GetIter(iterator.as_ptr()))
+                .map_err(|e| crate::error::TokenizerError::InvalidIterator { message: e.to_string() })?
                 .into()
         };
 
@@ -378,12 +468,14 @@ impl Tokenizer {
                     };
                     match next_obj {
                         Some(obj) => {
-                            let s: String = obj.extract()?;
+                            let s: String = obj.extract()
+                                .map_err(|e| crate::error::TokenizerError::InvalidInput { message: e.to_string() })?;
                             buf.push(s);
                         }
                         None => {
                             if pyo3::PyErr::occurred(py) {
-                                return Err(pyo3::PyErr::fetch(py));
+                                return Err(pyo3::PyErr::fetch(py)
+                                    .into());
                             } else {
                                 return Ok(true); // exhausted
                             }
@@ -445,86 +537,105 @@ impl Tokenizer {
             // 将文本分割为字符序列
             let mut ids = Vec::new();
             for ch in chunk.chars() {
-                // 直接使用字节值
-                for byte in ch.to_string().as_bytes() {
-                    ids.push(*byte as WordId);
+                // 直接使用字符的Unicode码点作为token ID
+                let code_point = ch as u32;
+                // 确保字符在词汇表中
+                if !self.vocab.contains_key(&code_point) {
+                    self.vocab.insert(code_point, ch.to_string());
+                    if code_point >= self.next_token_id {
+                        self.next_token_id = code_point + 1;
+                    }
                 }
+                ids.push(code_point);
             }
             
             words.push(Word::new(ids));
             cvec.push(c);
         }
 
-        self.train_core_incremental(words, vocab_size);
+        self._train_core_incremental(words, vocab_size);
         Ok(())
     }
 
     /// 返回正则表达式模式
     #[cfg(feature = "python")]
     #[pyo3(text_signature = "(self)")]
-    pub fn get_pattern(&self) -> String {
+    pub fn _get_pattern(&self) -> String {
         self.base.pattern.clone()
     }
 
     /// 获取合并等级映射
     #[cfg(feature = "python")]
-    #[pyo3(name = "get_mergeable_ranks")]
+    #[pyo3(name = "_get_mergeable_ranks")]
     pub fn py_get_mergeable_ranks(&self) -> StdHashMap<(WordId, WordId), u32> {
-        self.get_mergeable_ranks_internal()
+        self._get_mergeable_ranks_internal()
     }
     
     /// 获取词汇表大小
     #[cfg(feature = "python")]
-    pub fn vocab_size(&self) -> usize {
+    pub fn _vocab_size(&self) -> usize {
         self.vocab.len()
     }
     
     /// 获取词汇表
     #[cfg(feature = "python")]
-    pub fn get_vocab(&self) -> StdHashMap<WordId, String> {
+    pub fn _get_vocab(&self) -> StdHashMap<WordId, String> {
         self.vocab.clone()
     }
 
     /// 将文本编码为token IDs
     #[cfg(feature = "python")]
     #[pyo3(text_signature = "(self, text)")]
-    pub fn py_encode(&self, text: &str) -> Vec<u32> {
-        self.encode(text).unwrap_or_else(|e| {
-            log::error!("编码失败: {}", e);
-            Vec::new()
-        })
+    pub fn _py_encode(&self, text: &str) -> Vec<u32> {
+        match self._encode_internal(text) {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                log::error!("编码失败: {}", e);
+                Vec::new()
+            }
+        }
     }
 
     /// 将token IDs解码为文本
     #[cfg(feature = "python")]
     #[pyo3(text_signature = "(self, tokens)")]
-    pub fn py_decode(&self, tokens: Vec<u32>) -> String {
-        self.decode(&tokens).unwrap_or_else(|e| {
-            log::error!("解码失败: {}", e);
-            format!("[解码错误: {}]", e)
-        })
+    pub fn _py_decode(&self, tokens: Vec<u32>) -> PyResult<String> {
+        self.decode_internal(tokens)
+            .map_err(|e| crate::error::TokenizerError::DecodingError { message: e.to_string() }.into())
     }
-}
-
-#[cfg(feature = "python")]
-impl TokenizerTrait for Tokenizer {
-    type TokenId = u32;
     
-    /// 编码文本为token ID序列，参考template.rs中的实现
-    fn encode(&self, text: &str) -> Result<Vec<Self::TokenId>, String> {
+    /// 内部编码实现
+    fn _encode_internal(&self, text: &str) -> Result<Vec<u32>, crate::error::TokenizerError> {
         // 使用正则表达式分割文本
-        let parts = self.base.split_text(text)?;
-        
         let mut result = Vec::new();
-        
-        for part in parts {
-            if part.is_empty() {
+        for mat in self.base.compiled_pattern.find_iter(text) {
+            let piece = match mat {
+                Ok(m) => m.as_str(),
+                Err(e) => return Err(crate::error::TokenizerError::EncodingError { message: format!("正则表达式匹配失败: {}", e) }),
+            };
+            
+            if piece.is_empty() {
                 continue;
             }
             
-            // 将文本转换为字节序列
-            let bytes = part.as_bytes();
-            let mut ids: Vec<WordId> = bytes.iter().map(|&b| b as WordId).collect();
+            // 首先尝试直接匹配整个片段
+            if let Some((&id, _)) = self.vocab.iter().find(|(_, v)| **v == piece) {
+                result.push(id);
+                continue;
+            }
+            
+            // 将文本转换为字符序列
+            let mut ids: Vec<WordId> = Vec::new();
+            for ch in piece.chars() {
+                let ch_str = ch.to_string();
+                // 首先尝试在词汇表中查找字符
+                if let Some((&id, _)) = self.vocab.iter().find(|(_, v)| **v == ch_str) {
+                    ids.push(id);
+                } else {
+                    // 如果找不到，使用字符的Unicode码点作为token ID
+                    ids.push(ch as u32);
+                }
+            }
             
             // 应用合并规则
             let mut changed = true;
@@ -559,26 +670,48 @@ impl TokenizerTrait for Tokenizer {
         Ok(result)
     }
     
-    /// 解码token ID序列为文本，参考template.rs中的实现
-    fn decode(&self, tokens: &[WordId]) -> Result<String, String> {
+    /// 内部解码实现
+    fn decode_internal(&self, tokens: Vec<u32>) -> Result<String, crate::error::TokenizerError> {
         let mut result = String::new();
         
-        for &token in tokens {
+        for token in tokens {
             if let Some(text) = self.vocab.get(&token) {
+                // 直接使用词汇表中的文本
                 result.push_str(text);
             } else {
-                // 如果找不到对应的词汇，尝试作为字节处理
-                if token < 256 {
-                    // 对于字节值，直接转换为字符
-                    result.push(token as u8 as char);
+                // 如果找不到对应的词汇，尝试作为Unicode字符处理
+                if let Some(c) = char::from_u32(token) {
+                    result.push(c);
                 } else {
-                    // 对于大于255的token，使用替换字符
+                    // 如果不是有效的Unicode字符，使用替换字符
                     result.push('�');
                 }
             }
         }
         
         Ok(result)
+    }
+}
+
+#[cfg(feature = "python")]
+impl Default for Tokenizer {
+    fn default() -> Self {
+        Self::_new_internal().unwrap()
+    }
+}
+
+#[cfg(feature = "python")]
+impl TokenizerTrait for Tokenizer {
+    type TokenId = u32;
+    
+    /// 编码文本为token ID序列
+    fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+        self._encode_internal(text).map_err(|e| e.to_string())
+    }
+    
+    /// 解码token ID序列为文本，参考template.rs中的实现
+    fn decode(&self, tokens: &[u32]) -> Result<String, String> {
+        self.decode_internal(tokens.to_vec()).map_err(|e| e.to_string())
     }
     
     /// 训练分词器，参考template.rs中的实现
@@ -605,9 +738,20 @@ impl TokenizerTrait for Tokenizer {
                         continue;
                     }
                     
-                    // 将每个部分转换为字节序列
-                    let bytes = part.as_bytes();
-                    let ids: Vec<WordId> = bytes.iter().map(|&b| b as WordId).collect();
+                    // 将每个部分转换为字符序列
+                    let mut ids = Vec::new();
+                    for ch in part.chars() {
+                        // 直接使用字符的Unicode码点作为token ID
+                        let code_point = ch as u32;
+                        // 确保字符在词汇表中
+                        if !self.vocab.contains_key(&code_point) {
+                            self.vocab.insert(code_point, ch.to_string());
+                            if code_point >= self.next_token_id {
+                                self.next_token_id = code_point + 1;
+                            }
+                        }
+                        ids.push(code_point);
+                    }
                     
                     if !ids.is_empty() {
                         words.push(Word::new(ids));
@@ -620,7 +764,7 @@ impl TokenizerTrait for Tokenizer {
         log::info!("已处理 {} 个词", words.len());
         
         // 使用增量训练核心
-        self.train_core_incremental(words, vocab_size);
+        self._train_core_incremental(words, vocab_size);
         log::info!("BPE训练完成，最终合并规则数: {}", self.merges.len());
         log::info!("训练后词汇表大小: {}, next_token_id: {}", self.vocab.len(), self.next_token_id);
         

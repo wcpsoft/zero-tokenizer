@@ -19,13 +19,8 @@ if [ -d ".venv" ]; then
     source .venv/bin/activate
 fi
 
-# 使用uv或pip安装依赖
-if command -v uv &> /dev/null; then
-    echo "使用uv安装依赖..."
-    uv pip install -e .
-else
-    echo "使用pip安装依赖..."
-    pip install -e .
-fi
+# 使用maturin安装包
+echo "使用maturin安装Python包..."
+maturin develop
 
 echo "Python包安装完成！"

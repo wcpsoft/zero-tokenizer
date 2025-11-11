@@ -25,7 +25,7 @@ def main():
     
     # 创建BPE分词器实例
     print("\n1. 创建BPE分词器实例")
-    tokenizer = zero_tokenizer.bpe()
+    tokenizer = zero_tokenizer.Tokenizer()
     print("✓ BPE分词器创建成功")
     
     # 示例文本
@@ -55,14 +55,23 @@ def main():
     
     # 展示token到单词的映射
     print("\n6. Token到单词的映射:")
+    vocab = tokenizer.get_vocab()
     for i, token_id in enumerate(tokens[:10]):  # 只显示前10个token
-        token = tokenizer.id_to_token(token_id)
-        print(f"  Token {i+1}: ID={token_id}, Token='{token}'")
+        # 查找token对应的文本
+        token_text = None
+        for text, id in vocab.items():
+            if id == token_id:
+                token_text = text
+                break
+        if token_text:
+            print(f"  Token {i+1}: ID={token_id}, Token='{token_text}'")
+        else:
+            print(f"  Token {i+1}: ID={token_id}, Token='<not found>'")
     
     # 统计信息
     print("\n7. 分词器统计信息:")
     print(f"  词汇表大小: {tokenizer.get_vocab_size()}")
-    print(f"  特殊token数量: {len(tokenizer.get_special_tokens())}")
+    print(f"  合并规则数量: {len(tokenizer.merges)}")
     
     print("\n示例完成!")
 

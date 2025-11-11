@@ -16,6 +16,8 @@ pub struct WordPieceTokenizer {
     pub scores: Vec<f64>,
     /// 未知标记ID
     pub unk_token_id: u32,
+    /// 下一个可用的token ID
+    pub next_token_id: u32,
 }
 
 impl WordPieceTokenizer {
@@ -27,6 +29,7 @@ impl WordPieceTokenizer {
             base,
             scores: Vec::new(),
             unk_token_id: 0,
+            next_token_id: 0,
         };
         
         // 初始化字节词汇表和常用汉字
@@ -44,6 +47,7 @@ impl WordPieceTokenizer {
             base,
             scores: Vec::new(),
             unk_token_id: 0,
+            next_token_id: 0,
         };
         
         // 初始化字节词汇表和常用汉字
@@ -81,6 +85,8 @@ impl WordPieceTokenizer {
         
         // 设置未知标记ID
         self.unk_token_id = 0;
+        // 设置下一个可用的token ID
+        self.next_token_id = self.base.vocab.len() as u32;
     }
     
     /// 加载常用汉字
@@ -106,6 +112,55 @@ impl WordPieceTokenizer {
             }
         }
         
+        // 更新下一个可用的token ID
+        self.next_token_id = self.base.vocab.len() as u32;
+        
+        Ok(())
+    }
+    
+    /// 从dict目录加载初始化词表
+    fn _load_vocab_from_dict(&mut self, dict_file: &str) -> Result<(), String> {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+        
+        let file = File::open(dict_file)
+            .map_err(|e| format!("无法打开词表文件: {}", e))?;
+        
+        let reader = BufReader::new(file);
+        
+        // 清除256以上的条目，保留基础字节词汇表
+        let keys_to_remove: Vec<String> = self.base.vocab_rev
+            .iter()
+            .filter(|(&id, _)| id >= 256)
+            .map(|(_, token)| token.clone())
+            .collect();
+            
+        for key in keys_to_remove {
+            if let Some(id) = self.base.vocab.remove(&key) {
+                self.base.vocab_rev.remove(&id);
+                // 如果分数数组足够大，也移除对应的分数
+                if id < self.scores.len() as u32 {
+                    self.scores.remove(id as usize);
+                }
+            }
+        }
+        
+        // 从文件加载新的词汇
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("读取词表文件失败: {}", e))?;
+            let token = line.trim();
+            if !token.is_empty() {
+                // 检查token是否已存在
+                if !self.base.vocab.contains_key(token) {
+                    self.base.vocab.insert(token.to_string(), self.next_token_id);
+                    self.base.vocab_rev.insert(self.next_token_id, token.to_string());
+                    self.scores.push(0.0); // 初始分数为0
+                    self.next_token_id += 1;
+                }
+            }
+        }
+        
+        println!("从{}加载词表完成，当前词汇表大小: {}", dict_file, self.base.vocab.len());
         Ok(())
     }
 
@@ -409,6 +464,14 @@ impl WordPieceTokenizer {
     fn set_scores(&mut self, scores: Vec<f64>) -> PyResult<()> {
         self.scores = scores;
         Ok(())
+    }
+    
+    /// 从dict目录加载初始化词表
+    #[cfg(feature = "python")]
+    #[pyo3(name = "load_vocab_from_dict")]
+    pub fn py_load_vocab_from_dict(&mut self, dict_file: String) -> PyResult<()> {
+        self._load_vocab_from_dict(&dict_file)
+            .map_err(|e| PyValueError::new_err(format!("加载词表失败: {}", e)))
     }
 }
 

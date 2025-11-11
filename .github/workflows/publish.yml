@@ -1,0 +1,121 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Install Python dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3 python3-pip
+        pip3 install --upgrade pip
+        pip3 install maturin pytest
+    
+    - name: Check formatting
+      run: cargo fmt -- --check
+    
+    - name: Run clippy
+      run: cargo clippy -- -D warnings
+    
+    - name: Run tests
+      run: cargo test --verbose
+    
+    - name: Build Python package
+      run: |
+        pip install maturin
+        maturin develop
+    
+    - name: Run Python tests
+      run: |
+        cd tests/python
+        python -m pytest -v
+
+  build:
+    name: Build wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Install Python dependencies
+      run: |
+        pip install --upgrade pip
+        pip install maturin
+    
+    - name: Build wheels
+      run: maturin build --release --out dist
+    
+    - name: Upload wheels
+      uses: actions/upload-artifact@v3
+      with:
+        name: wheels-${{ matrix.os }}
+        path: dist
+
+  publish:
+    name: Publish to PyPI
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install Python dependencies
+      run: |
+        pip install --upgrade pip
+        pip install maturin
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: dist-artifacts
+    
+    - name: Combine artifacts
+      run: |
+        mkdir -p dist
+        find dist-artifacts -name "*.whl" -exec cp {} dist/ \;
+    
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        password: ${{ secrets.PYPI_API_TOKEN }}

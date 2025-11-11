@@ -2,8 +2,6 @@ use std::collections::HashMap as StdHashMap;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
 
 use ahash::{AHashMap, AHashSet};
 use dary_heap::OctonaryHeap;
@@ -27,6 +25,8 @@ pub struct BBPETokenizer {
     pub base: TokenizerBase<u32>,
     /// 基础字符集合（用于初始化词汇表）
     pub base_chars: AHashSet<Vec<u8>>,
+    /// 下一个可用的token ID
+    pub next_token_id: u32,
 }
 
 impl BBPETokenizer {
@@ -40,6 +40,7 @@ impl BBPETokenizer {
             vocab_rev: StdHashMap::new(),
             base,
             base_chars: AHashSet::new(),
+            next_token_id: 0,
         };
         
         // 初始化词汇表，添加所有字节值
@@ -58,6 +59,7 @@ impl BBPETokenizer {
             vocab_rev: StdHashMap::new(),
             base,
             base_chars: AHashSet::new(),
+            next_token_id: 0,
         };
         
         // 初始化词汇表，添加所有字节值
@@ -84,6 +86,37 @@ impl BBPETokenizer {
         }
         
         log::info!("已加载 {} 个基础字符", self.base_chars.len());
+        Ok(())
+    }
+    
+    /// 从dict目录加载初始化词表
+    pub fn _load_vocab_from_dict(&mut self, dict_file: &str) -> Result<(), String> {
+        use std::fs::File;
+        use std::io::{self, BufRead};
+        
+        let dict_path = format!("dict/{}", dict_file);
+        let file = File::open(&dict_path)
+            .map_err(|e| format!("打开词表文件 {} 失败: {}", dict_path, e))?;
+        let reader = io::BufReader::new(file);
+        
+        // 保留基础字符和字节值，添加新词汇
+        let base_vocab_size = self.next_token_id;
+        
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("读取行失败: {}", e))?;
+            let token = line.trim();
+            if token.is_empty() {
+                continue;
+            }
+            
+            // 添加新词汇到词汇表
+            let token_bytes = token.as_bytes().to_vec();
+            self.vocab.insert(self.next_token_id, token_bytes.clone());
+            self.vocab_rev.insert(token_bytes, self.next_token_id);
+            self.next_token_id += 1;
+        }
+        
+        log::info!("已从 {} 加载 {} 个词汇", dict_file, self.next_token_id - base_vocab_size);
         Ok(())
     }
 
@@ -246,6 +279,7 @@ impl BBPETokenizer {
                 next_id += 1;
             }
         }
+        self.next_token_id = next_id;
         log::info!("已初始化词汇表，包含 {} 个基础字符和 {} 个字节值", self.base_chars.len(), next_id - self.base_chars.len() as u32);
     }
 }
@@ -264,27 +298,34 @@ impl BBPETokenizer {
     #[new]
     pub fn new() -> PyResult<Self> {
         Self::new_internal()
-            .map_err(|e| PyValueError::new_err(format!("创建分词器失败: {}", e)))
+            .map_err(|e| crate::error::TokenizerError::InitializationError { message: e }.into())
     }
 
     /// 使用自定义正则表达式模式创建新的BBPE分词器
     #[staticmethod]
     pub fn with_pattern(pattern: String) -> PyResult<Self> {
         Self::with_pattern_internal(pattern)
-            .map_err(|e| PyValueError::new_err(format!("创建分词器失败: {}", e)))
+            .map_err(|e| crate::error::TokenizerError::InitializationError { message: e }.into())
     }
 
     /// 从常用汉字字表文件加载基础字符
     #[cfg(feature = "python")]
     #[pyo3(name = "load_base_chars")]
     pub fn py_load_base_chars(&mut self, file_path: String) -> PyResult<()> {
-        self.load_base_chars(&file_path)
-            .map_err(|e| PyValueError::new_err(format!("加载基础字符失败: {}", e)))?;
+        self.load_base_chars(&file_path)?;
         
         // 重新初始化词汇表以包含新加载的基础字符
         self.init_vocab();
         
         Ok(())
+    }
+    
+    /// 从dict目录加载初始化词表
+    #[cfg(feature = "python")]
+    #[pyo3(name = "load_vocab_from_dict")]
+    pub fn py_load_vocab_from_dict(&mut self, dict_file: String) -> PyResult<()> {
+        self._load_vocab_from_dict(&dict_file)
+            .map_err(|e| crate::error::TokenizerError::LoadError { message: e }.into())
     }
 
     /// 从Python迭代器训练分词器
@@ -297,7 +338,7 @@ impl BBPETokenizer {
         _show_progress: bool,
     ) -> PyResult<()> {
         self.train(texts, vocab_size as u32)
-            .map_err(|e| PyValueError::new_err(format!("训练失败: {}", e)))
+            .map_err(|e| crate::error::TokenizerError::TrainingError { message: e }.into())
     }
 
     /// 从迭代器训练分词器
@@ -305,7 +346,7 @@ impl BBPETokenizer {
     #[pyo3(name = "train")]
     pub fn py_train(&mut self, texts: Vec<String>, vocab_size: usize) -> PyResult<()> {
         self.train(texts, vocab_size as u32)
-            .map_err(|e| PyValueError::new_err(format!("训练失败: {}", e)))
+            .map_err(|e| crate::error::TokenizerError::TrainingError { message: e }.into())
     }
 
     /// 从迭代器训练分词器
@@ -318,7 +359,7 @@ impl BBPETokenizer {
         _show_progress: bool,
     ) -> PyResult<()> {
         self.train(texts, vocab_size as u32)
-            .map_err(|e| PyValueError::new_err(format!("训练失败: {}", e)))
+            .map_err(|e| crate::error::TokenizerError::TrainingError { message: e }.into())
     }
 
     /// 返回正则表达式模式
@@ -338,21 +379,17 @@ impl BBPETokenizer {
     /// 将文本编码为token IDs
     #[cfg(feature = "python")]
     #[pyo3(name = "encode")]
-    pub fn py_encode(&self, text: &str) -> Vec<u32> {
-        self.encode(text).unwrap_or_else(|e| {
-            log::error!("编码失败: {}", e);
-            Vec::new()
-        })
+    pub fn py_encode(&self, text: &str) -> PyResult<Vec<u32>> {
+        self.encode(text)
+            .map_err(|e| crate::error::TokenizerError::EncodingError { message: e }.into())
     }
 
     /// 将token IDs解码为文本
     #[cfg(feature = "python")]
     #[pyo3(name = "decode")]
-    pub fn py_decode(&self, tokens: Vec<u32>) -> String {
-        self.decode(&tokens).unwrap_or_else(|e| {
-            log::error!("解码失败: {}", e);
-            format!("[解码错误: {}]", e)
-        })
+    pub fn py_decode(&self, tokens: Vec<u32>) -> PyResult<String> {
+        self.decode(&tokens)
+            .map_err(|e| crate::error::TokenizerError::DecodingError { message: e }.into())
     }
 
     /// 获取词汇表大小
@@ -381,6 +418,22 @@ impl BBPETokenizer {
     #[pyo3(name = "get_merges")]
     pub fn py_get_merges(&self) -> StdHashMap<(u32, u32), u32> {
         self.merges.clone()
+    }
+
+    /// 保存分词器到文件
+    #[cfg(feature = "python")]
+    #[pyo3(name = "save")]
+    pub fn py_save(&self, path: String) -> PyResult<()> {
+        self.save(&path)
+            .map_err(|e| crate::error::TokenizerError::ModelSaveError { message: e }.into())
+    }
+
+    /// 从文件加载分词器
+    #[cfg(feature = "python")]
+    #[pyo3(name = "load")]
+    pub fn py_load(&mut self, path: String) -> PyResult<()> {
+        self.load(&path)
+            .map_err(|e| crate::error::TokenizerError::ModelLoadError { message: e }.into())
     }
 }
 
@@ -650,41 +703,31 @@ impl Tokenizer for BBPETokenizer {
 
 impl MergeBasedTokenizer for BBPETokenizer {
     fn apply_merges(&mut self, tokens: &mut Vec<Self::TokenId>) -> Result<(), String> {
-        // 实现合并逻辑
-        if tokens.len() < 2 {
-            return Ok(());
-        }
-        
+        // 应用合并规则，直到没有更多合并可以应用
         let mut changed = true;
         while changed {
             changed = false;
+            let mut new_tokens = Vec::new();
+            let mut i = 0;
             
-            // 查找最高优先级的合并
-            let mut best_merge: Option<((u32, u32), u32, usize)> = None;
-            
-            for i in 0..tokens.len() - 1 {
-                let pair = (tokens[i], tokens[i + 1]);
-                if let Some(&rank) = self.merges.get(&pair) {
-                    match &best_merge {
-                        None => {
-                            best_merge = Some((pair, rank, i));
-                        }
-                        Some((_, best_rank, _)) => {
-                            if rank < *best_rank {
-                                best_merge = Some((pair, rank, i));
-                            }
-                        }
+            while i < tokens.len() {
+                if i + 1 < tokens.len() {
+                    // 检查当前token对是否可以合并
+                    if let Some(&new_id) = self.merges.get(&(tokens[i], tokens[i+1])) {
+                        new_tokens.push(new_id);
+                        i += 2;
+                        changed = true;
+                    } else {
+                        new_tokens.push(tokens[i]);
+                        i += 1;
                     }
+                } else {
+                    new_tokens.push(tokens[i]);
+                    i += 1;
                 }
             }
             
-            // 执行最佳合并
-            if let Some(((_, _), _, pos)) = best_merge {
-                let new_id = self.vocab.len() as u32; // 使用新ID
-                tokens[pos] = new_id;
-                tokens.remove(pos + 1);
-                changed = true;
-            }
+            *tokens = new_tokens;
         }
         
         Ok(())

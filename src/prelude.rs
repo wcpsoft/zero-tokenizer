@@ -12,7 +12,7 @@ pub use crate::wordpiece::wordpiece::WordPieceTokenizer as WordPiece;
 /// 创建BPE分词器的便捷函数
 #[cfg(feature = "python")]
 pub fn bpe() -> Result<BPE, String> {
-    BPE::new_internal()
+    BPE::_new_internal()
 }
 
 /// 创建BBPE分词器的便捷函数

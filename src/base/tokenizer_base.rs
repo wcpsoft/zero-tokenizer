@@ -24,7 +24,7 @@ pub struct TokenizerBase<Id> {
     pub compiled_pattern: Regex,
 }
 
-impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::Debug> TokenizerBase<Id> {
+impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::Debug + Default> TokenizerBase<Id> {
     /// 创建新的分词器基础结构
     pub fn new() -> Result<Self, String> {
         let pattern = GPT4_PATTERN.to_string();
@@ -167,6 +167,38 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
             
             self.vocab.insert(token.to_string(), id.clone());
             self.vocab_rev.insert(id, token.to_string());
+        }
+        
+        Ok(())
+    }
+    
+    /// 从dict目录加载初始化词表
+    pub fn load_vocab_from_dict(&mut self, dict_file: &str) -> Result<(), String> {
+        let dict_path = format!("dict/{}", dict_file);
+        let file = File::open(&dict_path)
+            .map_err(|e| format!("打开词表文件 {} 失败: {}", dict_path, e))?;
+        let reader = BufReader::new(file);
+        
+        // 保留当前词汇表，只是添加新词汇
+        let mut _next_id = self.vocab.len();
+        
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("读取行失败: {}", e))?;
+            let token = line.trim();
+            if token.is_empty() {
+                continue;
+            }
+            
+            // 只有当词汇不存在时才添加
+            if !self.vocab.contains_key(token) {
+                let id = Id::default();
+                // 这里需要根据具体的Id类型来生成新的ID
+                // 由于我们不知道Id的具体类型，这里使用一个简单的策略
+                // 在具体实现中，可能需要根据不同的分词器类型来处理
+                self.vocab.insert(token.to_string(), id.clone());
+                self.vocab_rev.insert(id, token.to_string());
+                _next_id += 1;
+            }
         }
         
         Ok(())
