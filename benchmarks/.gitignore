@@ -1,0 +1,13 @@
+# 忽略基准测试结果文件
+benchmark_results.json
+*.json
+
+# 忽略临时文件
+*.pyc
+__pycache__/
+.pytest_cache/
+
+# 忽略生成的模型文件
+*.model
+*.vocab
+tokenizer.json

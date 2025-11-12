@@ -5,55 +5,55 @@ use thiserror::Error;
 pub enum TokenizerError {
     #[error("编码错误: {message}")]
     EncodingError { message: String },
-    
+
     #[error("解码错误: {message}")]
     DecodingError { message: String },
-    
+
     #[error("训练错误: {message}")]
     TrainingError { message: String },
-    
+
     #[error("模型加载错误: {message}")]
     ModelLoadError { message: String },
-    
+
     #[error("模型保存错误: {message}")]
     ModelSaveError { message: String },
-    
+
     #[error("词汇表错误: {message}")]
     VocabError { message: String },
-    
+
     #[error("输入验证错误: {message}")]
     InputValidationError { message: String },
-    
+
     #[error("初始化错误: {message}")]
     InitializationError { message: String },
-    
+
     #[error("加载错误: {message}")]
     LoadError { message: String },
-    
+
     #[error("分割错误: {message}")]
     SplitError { message: String },
-    
+
     #[error("无效迭代器: {message}")]
     InvalidIterator { message: String },
-    
+
     #[error("无效输入: {message}")]
     InvalidInput { message: String },
-    
+
     #[error("无效正则表达式: {message}")]
     InvalidRegex { message: String },
-    
+
     #[error("IO错误: {source}")]
     IoError {
         #[from]
         source: std::io::Error,
     },
-    
+
     #[error("序列化错误: {source}")]
     SerializationError {
         #[from]
         source: serde_json::Error,
     },
-    
+
     #[error("正则表达式错误: {source}")]
     RegexError {
         #[from]
@@ -92,9 +92,7 @@ impl From<TokenizerError> for pyo3::PyErr {
             TokenizerError::InitializationError { message } => {
                 pyo3::exceptions::PyRuntimeError::new_err(message)
             }
-            TokenizerError::LoadError { message } => {
-                pyo3::exceptions::PyIOError::new_err(message)
-            }
+            TokenizerError::LoadError { message } => pyo3::exceptions::PyIOError::new_err(message),
             TokenizerError::SplitError { message } => {
                 pyo3::exceptions::PyValueError::new_err(message)
             }

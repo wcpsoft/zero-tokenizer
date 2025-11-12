@@ -2,10 +2,10 @@
 //!
 //! 导出所有常用的类型和特征，方便使用。
 
-pub use crate::base::traits::{Tokenizer, SubwordTokenizer};
+pub use crate::base::traits::{SubwordTokenizer, Tokenizer};
+pub use crate::bbpe::bbpe::BBPETokenizer as BBPE;
 #[cfg(feature = "python")]
 pub use crate::bpe::bpe::Tokenizer as BPE;
-pub use crate::bbpe::bbpe::BBPETokenizer as BBPE;
 pub use crate::unigram::unigram::UnigramTokenizer as Unigram;
 pub use crate::wordpiece::wordpiece::WordPieceTokenizer as WordPiece;
 

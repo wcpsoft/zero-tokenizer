@@ -10,12 +10,12 @@ impl<Id> Word<Id> {
     pub fn new(ids: Vec<Id>) -> Self {
         Self { ids }
     }
-    
+
     /// 获取ID序列
     pub fn ids(&self) -> &[Id] {
         &self.ids
     }
-    
+
     /// 获取ID序列的可变引用
     pub fn ids_mut(&mut self) -> &mut Vec<Id> {
         &mut self.ids
@@ -27,7 +27,7 @@ impl<Id: Clone> Word<Id> {
     pub fn pairs(&self) -> impl Iterator<Item = (Id, Id)> + '_ {
         self.ids.windows(2).map(|w| (w[0].clone(), w[1].clone()))
     }
-    
+
     /// 合并指定的词对，返回受影响的词对及其变化
     /// 这是一个通用实现，适用于BPE和BBPE
     pub fn merge_pair<F>(&mut self, pair: (Id, Id), new_id: Id, id_eq: F) -> Vec<((Id, Id), i32)>
@@ -36,34 +36,50 @@ impl<Id: Clone> Word<Id> {
         Id: PartialEq,
     {
         let mut affected_pairs = Vec::new();
+        let mut new_ids: Vec<Id> = Vec::with_capacity(self.ids.len());
         let mut i = 0;
-        
-        while i < self.ids.len() - 1 {
-            if id_eq(&self.ids[i], &pair.0) && id_eq(&self.ids[i + 1], &pair.1) {
-                // 记录受影响的词对
-                if i > 0 {
-                    affected_pairs.push(((self.ids[i - 1].clone(), self.ids[i].clone()), -1));
+
+        while i < self.ids.len() {
+            if i + 1 < self.ids.len()
+                && id_eq(&self.ids[i], &pair.0)
+                && id_eq(&self.ids[i + 1], &pair.1)
+            {
+                // 记录受影响的词对（在合并之前）
+                if !new_ids.is_empty() {
+                    let prev_idx = new_ids.len() - 1;
+                    affected_pairs.push(((new_ids[prev_idx].clone(), self.ids[i].clone()), -1));
                 }
                 if i + 2 < self.ids.len() {
                     affected_pairs.push(((self.ids[i + 1].clone(), self.ids[i + 2].clone()), -1));
                 }
-                
-                // 执行合并
-                self.ids[i] = new_id.clone();
-                self.ids.remove(i + 1);
-                
-                // 记录新创建的词对
-                if i > 0 {
-                    affected_pairs.push(((self.ids[i - 1].clone(), self.ids[i].clone()), 1));
+
+                // 添加合并后的新ID
+                new_ids.push(new_id.clone());
+
+                // 记录新创建的词对（在合并之后）
+                if new_ids.len() > 1 {
+                    let prev_idx = new_ids.len() - 2;
+                    affected_pairs.push((
+                        (
+                            new_ids[prev_idx].clone(),
+                            new_ids[new_ids.len() - 1].clone(),
+                        ),
+                        1,
+                    ));
                 }
-                if i < self.ids.len() - 1 {
-                    affected_pairs.push(((self.ids[i].clone(), self.ids[i + 1].clone()), 1));
+                if i + 2 < self.ids.len() {
+                    affected_pairs.push(((new_id.clone(), self.ids[i + 2].clone()), 1));
                 }
+
+                // 跳过被合并的两个token
+                i += 2;
             } else {
+                new_ids.push(self.ids[i].clone());
                 i += 1;
             }
         }
-        
+
+        self.ids = new_ids;
         affected_pairs
     }
 }

@@ -48,12 +48,12 @@ impl<Id: Clone + Hash + Eq + Ord> MergeJob<Id> {
             pos: HashSet::new(),
         }
     }
-    
+
     /// 添加词索引
     pub fn add_position(&mut self, pos: usize) {
         self.pos.insert(pos);
     }
-    
+
     /// 批量添加词索引
     pub fn add_positions(&mut self, positions: &[usize]) {
         for &pos in positions {

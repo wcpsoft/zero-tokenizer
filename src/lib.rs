@@ -2,12 +2,12 @@
 use pyo3::prelude::*;
 
 pub mod base;
-pub mod bpe;
 pub mod bbpe;
+pub mod bpe;
+pub mod error;
+pub mod prelude;
 pub mod unigram;
 pub mod wordpiece;
-pub mod prelude;
-pub mod error;
 
 /// 导出所有分词器到Python
 #[cfg(feature = "python")]

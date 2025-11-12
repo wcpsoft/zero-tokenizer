@@ -3,13 +3,17 @@ use std::collections::HashMap as StdHashMap;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
+#[cfg(feature = "python")]
+use pyo3::exceptions::PyValueError;
+
 use ahash::{AHashMap, AHashSet};
 use dary_heap::OctonaryHeap;
+use rayon::prelude::*;
 
-use crate::base::traits::{Tokenizer, MergeBasedTokenizer};
-use crate::base::word::Word;
 use crate::base::merge_job::MergeJob;
-use crate::base::tokenizer_base::{TokenizerBase, count_pairs_parallel};
+use crate::base::tokenizer_base::{count_pairs_parallel, TokenizerBase};
+use crate::base::traits::{MergeBasedTokenizer, Tokenizer};
+use crate::base::word::Word;
 
 /// BBPE (字节级BPE) 分词器
 #[cfg_attr(feature = "python", pyclass)]
@@ -33,7 +37,7 @@ impl BBPETokenizer {
     /// 创建新的BBPE分词器
     pub fn new_internal() -> Result<Self, String> {
         let base = TokenizerBase::new()?;
-        
+
         let mut tokenizer = Self {
             merges: StdHashMap::new(),
             vocab: StdHashMap::new(),
@@ -42,17 +46,17 @@ impl BBPETokenizer {
             base_chars: AHashSet::new(),
             next_token_id: 0,
         };
-        
+
         // 初始化词汇表，添加所有字节值
         tokenizer.init_vocab();
-        
+
         Ok(tokenizer)
     }
 
     /// 使用自定义正则表达式模式创建新的BBPE分词器
     pub fn with_pattern_internal(pattern: String) -> Result<Self, String> {
         let base = TokenizerBase::with_pattern(pattern)?;
-        
+
         let mut tokenizer = Self {
             merges: StdHashMap::new(),
             vocab: StdHashMap::new(),
@@ -61,10 +65,10 @@ impl BBPETokenizer {
             base_chars: AHashSet::new(),
             next_token_id: 0,
         };
-        
+
         // 初始化词汇表，添加所有字节值
         tokenizer.init_vocab();
-        
+
         Ok(tokenizer)
     }
 
@@ -72,10 +76,10 @@ impl BBPETokenizer {
     pub fn load_base_chars(&mut self, file_path: &str) -> Result<(), std::io::Error> {
         use std::fs::File;
         use std::io::{self, BufRead};
-        
+
         let file = File::open(file_path)?;
         let reader = io::BufReader::new(file);
-        
+
         self.base_chars.clear();
         for line in reader.lines() {
             let line = line?;
@@ -84,77 +88,97 @@ impl BBPETokenizer {
                 self.base_chars.insert(char_str.as_bytes().to_vec());
             }
         }
-        
+
         log::info!("已加载 {} 个基础字符", self.base_chars.len());
         Ok(())
     }
-    
+
     /// 从dict目录加载初始化词表
     pub fn _load_vocab_from_dict(&mut self, dict_file: &str) -> Result<(), String> {
         use std::fs::File;
         use std::io::{self, BufRead};
-        
+
         let dict_path = format!("dict/{}", dict_file);
         let file = File::open(&dict_path)
             .map_err(|e| format!("打开词表文件 {} 失败: {}", dict_path, e))?;
         let reader = io::BufReader::new(file);
-        
+
         // 保留基础字符和字节值，添加新词汇
         let base_vocab_size = self.next_token_id;
-        
+
         for line in reader.lines() {
             let line = line.map_err(|e| format!("读取行失败: {}", e))?;
             let token = line.trim();
             if token.is_empty() {
                 continue;
             }
-            
+
             // 添加新词汇到词汇表
             let token_bytes = token.as_bytes().to_vec();
             self.vocab.insert(self.next_token_id, token_bytes.clone());
             self.vocab_rev.insert(token_bytes, self.next_token_id);
             self.next_token_id += 1;
         }
-        
-        log::info!("已从 {} 加载 {} 个词汇", dict_file, self.next_token_id - base_vocab_size);
+
+        log::info!(
+            "已从 {} 加载 {} 个词汇",
+            dict_file,
+            self.next_token_id - base_vocab_size
+        );
         Ok(())
     }
 
-    /// 应用合并规则到ID序列
+    /// 应用合并规则到ID序列（优化版：贪心合并）
     pub fn apply_merges(&self, ids: &mut Vec<u32>) {
-        // 重复应用合并规则，直到没有更多合并可以进行
-        loop {
-            // 查找最高优先级的可合并词对
-            let best_pair = {
-                let mut best_pair = None;
-                let mut best_priority = u32::MAX;
-                
-                for i in 0..ids.len() - 1 {
-                    let pair = (ids[i], ids[i + 1]);
-                    if let Some(&priority) = self.merges.get(&pair) {
-                        if priority < best_priority {
-                            best_pair = Some((i, pair, priority));
-                            best_priority = priority;
-                        }
-                    }
+        // 持续应用合并规则，直到没有更多可能的合并
+        while ids.len() >= 2 {
+            // 在一次扫描中找到所有可以合并的位置
+            let mut merges_to_apply = Vec::new();
+            let mut i = 0;
+
+            while i < ids.len() - 1 {
+                if let Some(&new_id) = self.merges.get(&(ids[i], ids[i + 1])) {
+                    merges_to_apply.push((i, new_id));
+                    i += 2; // 跳过已合并的pair
+                } else {
+                    i += 1;
                 }
-                best_pair
-            };
-            
-            // 如果没有找到可合并的词对，结束
-            let (i, _pair, new_id) = match best_pair {
-                Some(val) => val,
-                None => break,
-            };
-            
-            // 执行合并
-            ids[i] = new_id;
-            ids.remove(i + 1);
+            }
+
+            if merges_to_apply.is_empty() {
+                break;
+            }
+
+            // 应用所有合并，从后往前以避免索引偏移问题
+            let mut new_ids = Vec::with_capacity(ids.len());
+            let mut next_merge_idx = 0;
+            let mut i = 0;
+
+            while i < ids.len() {
+                if next_merge_idx < merges_to_apply.len()
+                    && merges_to_apply[next_merge_idx].0 == i
+                {
+                    // 这个位置需要合并
+                    new_ids.push(merges_to_apply[next_merge_idx].1);
+                    i += 2; // 跳过被合并的两个token
+                    next_merge_idx += 1;
+                } else {
+                    new_ids.push(ids[i]);
+                    i += 1;
+                }
+            }
+
+            *ids = new_ids;
         }
     }
 
     /// 给定唯一词的核心增量BPE训练
-    fn train_core_incremental(&mut self, mut words: Vec<Word<u32>>, counts: Vec<i32>, vocab_size: u32) {
+    fn train_core_incremental(
+        &mut self,
+        mut words: Vec<Word<u32>>,
+        counts: Vec<i32>,
+        vocab_size: u32,
+    ) {
         let num_merges = vocab_size - self.vocab.len() as u32;
         log::info!("开始增量BBPE训练: 需要计算 {} 次合并", num_merges);
         self.merges.clear();
@@ -188,7 +212,9 @@ impl BBPETokenizer {
             let mut pair_counts = pair_counts;
 
             while merges_done < num_merges {
-                let Some(top) = heap.pop() else { break; };
+                let Some(top) = heap.pop() else {
+                    break;
+                };
 
                 // 如果此配对不再有效（由于之前的合并），跳过它
                 if let Some(&current_count) = pair_counts.get(&top.pair) {
@@ -217,11 +243,8 @@ impl BBPETokenizer {
                     let mut updated_where: AHashMap<(u32, u32), AHashSet<usize>> = AHashMap::new();
 
                     for &word_idx in &top.pos {
-                        let deltas = words[word_idx].merge_pair(
-                            top.pair.clone(),
-                            new_id,
-                            |a, b| a == b,
-                        );
+                        let deltas =
+                            words[word_idx].merge_pair(top.pair.clone(), new_id, |a, b| a == b);
                         for (pair, delta) in deltas {
                             *updated_pairs.entry(pair).or_insert(0) += delta * counts[word_idx];
                             updated_where.entry(pair).or_default().insert(word_idx);
@@ -234,7 +257,7 @@ impl BBPETokenizer {
                 for (pair, delta) in updated_pairs {
                     let entry = pair_counts.entry(pair).or_insert(0);
                     *entry += delta;
-                    
+
                     if *entry <= 0 {
                         pair_counts.remove(&pair);
                     } else if let Some(pos_set) = updated_where.get(&pair) {
@@ -245,7 +268,7 @@ impl BBPETokenizer {
                 }
 
                 merges_done += 1;
-                
+
                 // 每10%记录一次进度
                 let percent = merges_done * 100 / num_merges;
                 if percent > last_log_percent {
@@ -262,13 +285,13 @@ impl BBPETokenizer {
         log::info!("初始化词汇表");
         self.vocab.clear();
         self.vocab_rev.clear();
-        
+
         // 首先添加基础字符（如果有）
         for (i, char_bytes) in self.base_chars.iter().enumerate() {
             self.vocab.insert(i as u32, char_bytes.clone());
             self.vocab_rev.insert(char_bytes.clone(), i as u32);
         }
-        
+
         // 然后添加所有字节值（从0到255）
         let mut next_id = self.base_chars.len() as u32;
         for byte in 0..=255u8 {
@@ -280,7 +303,11 @@ impl BBPETokenizer {
             }
         }
         self.next_token_id = next_id;
-        log::info!("已初始化词汇表，包含 {} 个基础字符和 {} 个字节值", self.base_chars.len(), next_id - self.base_chars.len() as u32);
+        log::info!(
+            "已初始化词汇表，包含 {} 个基础字符和 {} 个字节值",
+            self.base_chars.len(),
+            next_id - self.base_chars.len() as u32
+        );
     }
 }
 
@@ -313,13 +340,13 @@ impl BBPETokenizer {
     #[pyo3(name = "load_base_chars")]
     pub fn py_load_base_chars(&mut self, file_path: String) -> PyResult<()> {
         self.load_base_chars(&file_path)?;
-        
+
         // 重新初始化词汇表以包含新加载的基础字符
         self.init_vocab();
-        
+
         Ok(())
     }
-    
+
     /// 从dict目录加载初始化词表
     #[cfg(feature = "python")]
     #[pyo3(name = "load_vocab_from_dict")]
@@ -392,6 +419,34 @@ impl BBPETokenizer {
             .map_err(|e| crate::error::TokenizerError::DecodingError { message: e }.into())
     }
 
+    /// 批量编码文本为token IDs（并行处理）
+    #[cfg(feature = "python")]
+    #[pyo3(name = "encode_batch")]
+    pub fn py_encode_batch(&self, texts: Vec<String>) -> PyResult<Vec<Vec<u32>>> {
+        // 使用rayon并行处理所有文本
+        let results: Result<Vec<Vec<u32>>, String> = texts
+            .par_iter()
+            .map(|text| self.encode(text))
+            .collect();
+
+        results.map_err(|e| {
+            crate::error::TokenizerError::EncodingError { message: e }.into()
+        })
+    }
+
+    /// 批量解码token IDs为文本（并行处理）
+    #[cfg(feature = "python")]
+    #[pyo3(name = "decode_batch")]
+    pub fn py_decode_batch(&self, token_lists: Vec<Vec<u32>>) -> PyResult<Vec<String>> {
+        // 使用rayon并行处理所有token列表
+        let results: Result<Vec<String>, String> = token_lists
+            .par_iter()
+            .map(|tokens| self.decode(tokens))
+            .collect();
+
+        results.map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
     /// 获取词汇表大小
     #[cfg(feature = "python")]
     #[pyo3(name = "vocab_size")]
@@ -446,18 +501,18 @@ impl BBPETokenizer {
 
 impl Tokenizer for BBPETokenizer {
     type TokenId = u32;
-    
+
     fn encode(&self, text: &str) -> Result<Vec<Self::TokenId>, String> {
         // 使用正则表达式分割文本
         let parts = self.base.split_text(text)?;
-        
+
         let mut result = Vec::new();
-        
+
         for part in parts {
             if part.is_empty() {
                 continue;
             }
-            
+
             // 将每个部分转换为字节ID
             let mut ids: Vec<u32> = Vec::new();
             for &byte in part.as_bytes() {
@@ -469,12 +524,12 @@ impl Tokenizer for BBPETokenizer {
                     return Err(format!("未找到字节 {} 对应的ID", byte));
                 }
             }
-            
+
             // 应用合并规则
             self.apply_merges(&mut ids);
             result.extend(ids);
         }
-        
+
         // 如果没有匹配到任何内容，退回到简单分割
         if result.is_empty() {
             for word in text.split_whitespace() {
@@ -488,19 +543,19 @@ impl Tokenizer for BBPETokenizer {
                         return Err(format!("未找到字节 {} 对应的ID", byte));
                     }
                 }
-                
+
                 // 应用合并规则
                 self.apply_merges(&mut ids);
                 result.extend(ids);
             }
         }
-        
+
         Ok(result)
     }
-    
+
     fn decode(&self, tokens: &[Self::TokenId]) -> Result<String, String> {
         let mut bytes = Vec::new();
-        
+
         for &id in tokens {
             if let Some(token_bytes) = self.vocab.get(&id) {
                 bytes.extend_from_slice(token_bytes);
@@ -508,51 +563,69 @@ impl Tokenizer for BBPETokenizer {
                 return Err(format!("未找到ID {} 对应的词汇", id));
             }
         }
-        
+
         match String::from_utf8(bytes) {
             Ok(s) => Ok(s),
             Err(e) => Err(format!("UTF-8解码失败: {}", e)),
         }
     }
-    
+
     fn train(&mut self, texts: Vec<String>, vocab_size: u32) -> Result<(), String> {
         log::info!("开始BBPE训练，目标词汇表大小: {}", vocab_size);
-        assert!(vocab_size >= 256, "词汇表大小必须至少为256");
-        
+
+        // 验证词汇表大小
+        if vocab_size < 256 {
+            return Err("词汇表大小必须至少为256".to_string());
+        }
+
         // 只有在词汇表为空时才初始化
         if self.vocab.is_empty() {
             self.init_vocab();
         }
-        
+
         // 将文本转换为词序列
         log::info!("处理 {} 个文本样本", texts.len());
         let (words, counts) = {
             let mut words = Vec::new();
             let mut counts = Vec::new();
-            
+
             for text in &texts {
                 // 使用正则表达式分割文本
                 let parts = self.base.split_text(text)?;
-                
+
                 for part in parts {
                     if part.is_empty() {
                         continue;
                     }
-                    
-                    // 将词转换为字节ID
-                    let ids: Vec<u32> = part.bytes()
-                        .map(|b| b as u32)
+
+                    // 将词转换为字节ID - 通过vocab_rev查找每个字节对应的ID
+                    let ids: Vec<u32> = part
+                        .bytes()
+                        .map(|b| {
+                            let byte_vec = vec![b];
+                            *self
+                                .vocab_rev
+                                .get(&byte_vec)
+                                .unwrap_or_else(|| panic!("字节 {} 在vocab_rev中不存在", b))
+                        })
                         .collect();
                     words.push(Word::new(ids));
                     counts.push(1);
                 }
-                
+
                 // 如果没有匹配到任何内容，退回到简单分割
                 if words.is_empty() {
                     log::warn!("正则表达式未匹配，使用简单分割");
                     for word in text.split_whitespace() {
-                        let ids: Vec<u32> = word.bytes()
-                            .map(|b| b as u32)
+                        let ids: Vec<u32> = word
+                            .bytes()
+                            .map(|b| {
+                                let byte_vec = vec![b];
+                                *self
+                                    .vocab_rev
+                                    .get(&byte_vec)
+                                    .unwrap_or_else(|| panic!("字节 {} 在vocab_rev中不存在", b))
+                            })
                             .collect();
                         words.push(Word::new(ids));
                         counts.push(1);
@@ -561,91 +634,94 @@ impl Tokenizer for BBPETokenizer {
             }
             (words, counts)
         };
-        
+
         // 使用增量训练核心
         self.train_core_incremental(words, counts, vocab_size);
         log::info!("BBPE训练完成，最终词汇表大小: {}", self.vocab.len());
-        
+
         Ok(())
     }
-    
+
     fn vocab_size(&self) -> usize {
         self.vocab.len()
     }
-    
+
     fn save(&self, path: &str) -> Result<(), String> {
         // 使用基础分词器的保存方法
         self.base.save(path)?;
-        
+
         // 保存BBPE特定的数据
         use std::fs::OpenOptions;
         use std::io::Write;
-        
+
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
             .open(path)
             .map_err(|e| format!("打开文件失败: {}", e))?;
-        
+
         // 保存基础字符
         writeln!(file, "base_chars: {}", self.base_chars.len())
             .map_err(|e| format!("写入基础字符数量失败: {}", e))?;
-        
+
         for char_bytes in &self.base_chars {
             let char_str = String::from_utf8_lossy(char_bytes);
             writeln!(file, "base_char: {}", char_str)
                 .map_err(|e| format!("写入基础字符失败: {}", e))?;
         }
-        
+
         // 保存词汇表
         writeln!(file, "vocab: {}", self.vocab.len())
             .map_err(|e| format!("写入词汇表数量失败: {}", e))?;
-        
+
         for (id, bytes) in &self.vocab {
-            let byte_str = bytes.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" ");
+            let byte_str = bytes
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
             writeln!(file, "vocab_entry: {} {}", id, byte_str)
                 .map_err(|e| format!("写入词汇表条目失败: {}", e))?;
         }
-        
+
         // 保存合并规则
         writeln!(file, "merges: {}", self.merges.len())
             .map_err(|e| format!("写入合并规则数量失败: {}", e))?;
-        
+
         for ((a, b), &rank) in &self.merges {
             writeln!(file, "merge: {} {} {}", a, b, rank)
                 .map_err(|e| format!("写入合并规则失败: {}", e))?;
         }
-        
+
         Ok(())
     }
-    
+
     fn load(&mut self, path: &str) -> Result<(), String> {
         // 使用基础分词器的加载方法
         self.base.load(path)?;
-        
+
         // 加载BBPE特定的数据
         use std::fs::File;
         use std::io::{self, BufRead};
-        
-        let file = File::open(path)
-            .map_err(|e| format!("打开文件失败: {}", e))?;
+
+        let file = File::open(path).map_err(|e| format!("打开文件失败: {}", e))?;
         let reader = io::BufReader::new(file);
-        
+
         let lines = reader.lines();
         let mut in_base_chars = false;
         let mut in_vocab = false;
         let mut in_merges = false;
-        
+
         // 清空当前数据
         self.base_chars.clear();
         self.vocab.clear();
         self.vocab_rev.clear();
         self.merges.clear();
-        
+
         for line in lines {
             let line = line.map_err(|e| format!("读取行失败: {}", e))?;
             let line = line.trim();
-            
+
             if line.starts_with("base_chars: ") {
                 in_base_chars = true;
                 in_vocab = false;
@@ -670,13 +746,13 @@ impl Tokenizer for BBPETokenizer {
                 if in_vocab {
                     let parts: Vec<&str> = line[12..].split_whitespace().collect();
                     if parts.len() >= 2 {
-                        let id = parts[0].parse::<u32>()
+                        let id = parts[0]
+                            .parse::<u32>()
                             .map_err(|e| format!("解析词汇表ID失败: {}", e))?;
-                        let bytes: Result<Vec<u8>, _> = parts[1..].iter()
-                            .map(|s| s.parse::<u8>())
-                            .collect();
+                        let bytes: Result<Vec<u8>, _> =
+                            parts[1..].iter().map(|s| s.parse::<u8>()).collect();
                         let bytes = bytes.map_err(|e| format!("解析字节失败: {}", e))?;
-                        
+
                         self.vocab.insert(id, bytes.clone());
                         self.vocab_rev.insert(bytes, id);
                     }
@@ -685,18 +761,21 @@ impl Tokenizer for BBPETokenizer {
                 if in_merges {
                     let parts: Vec<&str> = line[6..].split_whitespace().collect();
                     if parts.len() == 3 {
-                        let a = parts[0].parse::<u32>()
+                        let a = parts[0]
+                            .parse::<u32>()
                             .map_err(|e| format!("解析合并规则失败: {}", e))?;
-                        let b = parts[1].parse::<u32>()
+                        let b = parts[1]
+                            .parse::<u32>()
                             .map_err(|e| format!("解析合并规则失败: {}", e))?;
-                        let rank = parts[2].parse::<u32>()
+                        let rank = parts[2]
+                            .parse::<u32>()
                             .map_err(|e| format!("解析合并规则失败: {}", e))?;
                         self.merges.insert((a, b), rank);
                     }
                 }
             }
         }
-        
+
         Ok(())
     }
 }
@@ -709,11 +788,11 @@ impl MergeBasedTokenizer for BBPETokenizer {
             changed = false;
             let mut new_tokens = Vec::new();
             let mut i = 0;
-            
+
             while i < tokens.len() {
                 if i + 1 < tokens.len() {
                     // 检查当前token对是否可以合并
-                    if let Some(&new_id) = self.merges.get(&(tokens[i], tokens[i+1])) {
+                    if let Some(&new_id) = self.merges.get(&(tokens[i], tokens[i + 1])) {
                         new_tokens.push(new_id);
                         i += 2;
                         changed = true;
@@ -726,17 +805,17 @@ impl MergeBasedTokenizer for BBPETokenizer {
                     i += 1;
                 }
             }
-            
+
             *tokens = new_tokens;
         }
-        
+
         Ok(())
     }
-    
+
     fn get_merges(&self) -> &StdHashMap<(Self::TokenId, Self::TokenId), Self::TokenId> {
         &self.merges
     }
-    
+
     fn set_merges(&mut self, merges: StdHashMap<(Self::TokenId, Self::TokenId), Self::TokenId>) {
         self.merges = merges;
     }
