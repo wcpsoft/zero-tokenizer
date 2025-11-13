@@ -1,1 +1,3 @@
-pub mod wordpiece;
+mod tokenizer;
+
+pub use tokenizer::WordPieceTokenizer;

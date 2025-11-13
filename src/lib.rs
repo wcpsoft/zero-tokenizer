@@ -14,9 +14,9 @@ pub mod wordpiece;
 #[pymodule]
 fn _zero_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pyo3_log::init(); // forwards Rust `log` to Python's `logging`
-    m.add_class::<bpe::bpe::Tokenizer>()?;
-    m.add_class::<bbpe::bbpe::BBPETokenizer>()?;
-    m.add_class::<unigram::unigram::UnigramTokenizer>()?;
-    m.add_class::<wordpiece::wordpiece::WordPieceTokenizer>()?;
+    m.add_class::<bpe::Tokenizer>()?;
+    m.add_class::<bbpe::BBPETokenizer>()?;
+    m.add_class::<unigram::UnigramTokenizer>()?;
+    m.add_class::<wordpiece::WordPieceTokenizer>()?;
     Ok(())
 }

@@ -30,6 +30,10 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
     TokenizerBase<Id>
 {
     /// 创建新的分词器基础结构
+    ///
+    /// # Errors
+    ///
+    /// 当默认正则表达式模式编译失败时返回错误（这种情况极少发生）
     pub fn new() -> Result<Self, String> {
         let pattern = GPT4_PATTERN.to_string();
         let compiled_pattern =
@@ -43,6 +47,10 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
     }
 
     /// 使用自定义正则表达式模式创建分词器基础结构
+    ///
+    /// # Errors
+    ///
+    /// 当提供的正则表达式模式无效或编译失败时返回错误
     pub fn with_pattern(pattern: String) -> Result<Self, String> {
         let compiled_pattern =
             Regex::new(&pattern).map_err(|e| format!("无效的正则表达式: {}", e))?;
@@ -55,6 +63,10 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
     }
 
     /// 添加标记到词汇表
+    ///
+    /// # Errors
+    ///
+    /// 当标记已存在于词汇表中或ID已被使用时返回错误
     pub fn add_token(&mut self, token: &str, id: Id) -> Result<(), String> {
         if self.vocab.contains_value(&token.to_string()) {
             return Err(format!("标记 '{}' 已存在于词汇表中", token));
@@ -69,21 +81,29 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
     }
 
     /// 获取标记的ID
+    #[must_use]
     pub fn get_token_id(&self, token: &str) -> Option<&Id> {
         self.vocab.get_by_value(&token.to_string())
     }
 
     /// 获取ID对应的标记
+    #[must_use]
     pub fn get_token(&self, id: &Id) -> Option<&String> {
         self.vocab.get_by_id(id)
     }
 
     /// 获取词汇表大小
+    #[must_use]
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
     }
 
     /// 使用正则表达式分割文本
+    ///
+    /// # Errors
+    ///
+    /// 当正则表达式匹配失败时返回错误。如果正则表达式无法匹配任何内容，
+    /// 将使用空格分割作为后备方案
     pub fn split_text(&self, text: &str) -> Result<Vec<String>, String> {
         let parts: Vec<String> = self
             .compiled_pattern
@@ -101,6 +121,10 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
     }
 
     /// 保存分词器到文件
+    ///
+    /// # Errors
+    ///
+    /// 当无法创建目录、文件创建失败或写入操作失败时返回错误
     pub fn save(&self, path: &str) -> Result<(), String> {
         let path = Path::new(path);
         if let Some(parent) = path.parent() {
@@ -128,6 +152,10 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
     }
 
     /// 从文件加载分词器
+    ///
+    /// # Errors
+    ///
+    /// 当文件不存在、文件格式无效、正则表达式编译失败或ID反序列化失败时返回错误
     pub fn load(&mut self, path: &str) -> Result<(), String> {
         let file = File::open(path).map_err(|e| format!("打开文件失败: {}", e))?;
         let reader = BufReader::new(file);
@@ -139,8 +167,8 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
 
         // 读取正则表达式模式
         if let Some(Ok(line)) = lines.next() {
-            if line.starts_with("pattern: ") {
-                self.pattern = line[9..].to_string();
+            if let Some(pattern_str) = line.strip_prefix("pattern: ") {
+                self.pattern = pattern_str.to_string();
                 self.compiled_pattern =
                     Regex::new(&self.pattern).map_err(|e| format!("无效的正则表达式: {}", e))?;
             }
@@ -178,18 +206,27 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
     Default for TokenizerBase<Id>
 {
     fn default() -> Self {
-        Self::new().unwrap()
+        Self::new().expect(
+            "Default TokenizerBase initialization failed: GPT4_PATTERN should always be valid. \
+             This is a programming error - please report this bug.",
+        )
     }
 }
+
+/// 词对计数映射类型：(Id, Id) -> 计数
+pub type PairCounts<Id> = HashMap<(Id, Id), i32>;
+
+/// 词对位置映射类型：(Id, Id) -> 词位置列表
+pub type PairPositions<Id> = HashMap<(Id, Id), Vec<usize>>;
 
 /// 并行计算词对频率的通用函数
 pub fn count_pairs_parallel<Id: Clone + Eq + Hash + Send + Sync>(
     words: &[Word<Id>],
     counts: &[i32],
-) -> (HashMap<(Id, Id), i32>, HashMap<(Id, Id), Vec<usize>>) {
+) -> (PairCounts<Id>, PairPositions<Id>) {
     use rayon::prelude::*;
 
-    let pair_counts: HashMap<(Id, Id), i32> = words
+    let pair_counts: PairCounts<Id> = words
         .par_iter()
         .enumerate()
         .map(|(i, word)| {
@@ -199,17 +236,14 @@ pub fn count_pairs_parallel<Id: Clone + Eq + Hash + Send + Sync>(
             }
             local_counts
         })
-        .reduce(
-            || HashMap::new(),
-            |mut acc, local_counts| {
-                for (pair, count) in local_counts {
-                    *acc.entry(pair).or_insert(0) += count;
-                }
-                acc
-            },
-        );
+        .reduce(HashMap::new, |mut acc, local_counts| {
+            for (pair, count) in local_counts {
+                *acc.entry(pair).or_insert(0) += count;
+            }
+            acc
+        });
 
-    let mut where_to_update: HashMap<(Id, Id), Vec<usize>> = HashMap::new();
+    let mut where_to_update: PairPositions<Id> = HashMap::new();
     for (i, word) in words.iter().enumerate() {
         for pair in word.pairs() {
             where_to_update.entry(pair).or_default().push(i);

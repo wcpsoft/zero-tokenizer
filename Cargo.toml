@@ -28,3 +28,45 @@ crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+
+# 集成测试配置
+[[test]]
+name = "bbpe_test"
+path = "tests/rust/bbpe_test.rs"
+
+[[test]]
+name = "bpe_test"
+path = "tests/rust/bpe_test.rs"
+required-features = ["python"]
+
+[[test]]
+name = "unigram_test"
+path = "tests/rust/unigram_test.rs"
+
+[[test]]
+name = "wordpiece_test"
+path = "tests/rust/wordpiece_test.rs"
+
+[[test]]
+name = "save_load_test"
+path = "tests/rust/save_load_test.rs"
+
+[[test]]
+name = "error_handling_test"
+path = "tests/rust/error_handling_test.rs"
+
+[[test]]
+name = "unicode_test"
+path = "tests/rust/unicode_test.rs"
+
+[[test]]
+name = "edge_cases_test"
+path = "tests/rust/edge_cases_test.rs"
+
+[[test]]
+name = "batch_operations_test"
+path = "tests/rust/batch_operations_test.rs"
+
+[[test]]
+name = "pattern_test"
+path = "tests/rust/pattern_test.rs"

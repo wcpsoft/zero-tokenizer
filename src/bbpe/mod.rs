@@ -1,1 +1,3 @@
-pub mod bbpe;
+mod tokenizer;
+
+pub use tokenizer::BBPETokenizer;

@@ -55,10 +55,16 @@ pub enum TokenizerError {
     },
 
     #[error("正则表达式错误: {source}")]
-    RegexError {
-        #[from]
-        source: fancy_regex::Error,
-    },
+    RegexError { source: Box<fancy_regex::Error> },
+}
+
+// 手动实现 From<fancy_regex::Error> 以支持 Box 包装
+impl From<fancy_regex::Error> for TokenizerError {
+    fn from(error: fancy_regex::Error) -> Self {
+        TokenizerError::RegexError {
+            source: Box::new(error),
+        }
+    }
 }
 
 /// 结果类型别名

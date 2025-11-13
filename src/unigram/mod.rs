@@ -1,1 +1,3 @@
-pub mod unigram;
+mod tokenizer;
+
+pub use tokenizer::UnigramTokenizer;

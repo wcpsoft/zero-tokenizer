@@ -12,9 +12,9 @@ mod test_utils;
 fn test_bpe_tokenizer() {
     let mut tokenizer = zero_tokenizer::prelude::bpe().unwrap();
     let text = "Hello world, this is a test sentence for BPE tokenizer.";
-    
+
     test_utils::test_tokenizer_training(&mut tokenizer, text, 1000);
-    
+
     // BPE特定的验证
     assert!(tokenizer.vocab_size() >= 256 && tokenizer.vocab_size() <= 1000);
 }
@@ -25,7 +25,7 @@ fn test_bpe_tokenizer() {
 fn test_bpe_encode_decode() {
     let mut tokenizer = zero_tokenizer::prelude::bpe().unwrap();
     let text = "This is a test sentence for BPE tokenizer.";
-    
+
     test_utils::test_encode_decode_roundtrip(&mut tokenizer, text, 1000);
 }
 
@@ -34,7 +34,7 @@ fn test_bpe_encode_decode() {
 #[test]
 fn test_bpe_default() {
     let tokenizer = zero_tokenizer::prelude::bpe().unwrap();
-    
+
     test_utils::test_default_constructor(&tokenizer, 256); // BPE初始化时包含所有字节值
 }
 
@@ -43,11 +43,11 @@ fn test_bpe_default() {
 #[test]
 fn test_word_pairs() {
     let mut tokenizer = zero_tokenizer::prelude::bpe().unwrap();
-    
+
     // 训练分词器
     let text = "hello world";
     tokenizer.train(vec![text.to_string()], 100).unwrap();
-    
+
     // 验证词对生成
     let word = tokenizer.encode(text).unwrap();
     assert!(!word.is_empty());
@@ -58,11 +58,11 @@ fn test_word_pairs() {
 #[test]
 fn test_word_merge_pair() {
     let mut tokenizer = zero_tokenizer::prelude::bpe().unwrap();
-    
+
     // 训练分词器
     let text = "hello world";
     tokenizer.train(vec![text.to_string()], 100).unwrap();
-    
+
     // 验证词对合并
     let word = tokenizer.encode(text).unwrap();
     assert!(!word.is_empty());

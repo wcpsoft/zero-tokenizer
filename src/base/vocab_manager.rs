@@ -21,7 +21,7 @@ use std::hash::Hash;
 /// vocab.insert(0, "hello".to_string());
 ///
 /// assert_eq!(vocab.get_by_id(&0), Some(&"hello".to_string()));
-/// assert_eq!(vocab.get_by_value("hello"), Some(&0));
+/// assert_eq!(vocab.get_by_value(&"hello".to_string()), Some(&0));
 /// ```
 #[derive(Clone, Debug)]
 pub struct VocabManager<K, V>
@@ -41,6 +41,7 @@ where
     V: Eq + Hash + Clone + Debug,
 {
     /// 创建新的空词汇表管理器
+    #[must_use]
     pub fn new() -> Self {
         Self {
             id_to_value: HashMap::new(),
@@ -49,6 +50,7 @@ where
     }
 
     /// 使用指定容量创建词汇表管理器
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             id_to_value: HashMap::with_capacity(capacity),
@@ -142,12 +144,14 @@ where
 
     /// 获取词汇表大小
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.id_to_value.len()
     }
 
     /// 检查词汇表是否为空
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.id_to_value.is_empty()
     }

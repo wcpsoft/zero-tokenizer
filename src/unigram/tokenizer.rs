@@ -34,7 +34,7 @@ impl UnigramTokenizer {
 
         // 初始化字节词汇表和常用汉字
         tokenizer.init_byte_vocab();
-        tokenizer.load_common_chinese_chars()?;
+        tokenizer.load_common_chinese_chars(None)?;
 
         Ok(tokenizer)
     }
@@ -52,7 +52,7 @@ impl UnigramTokenizer {
 
         // 初始化字节词汇表和常用汉字
         tokenizer.init_byte_vocab();
-        tokenizer.load_common_chinese_chars()?;
+        tokenizer.load_common_chinese_chars(None)?;
 
         Ok(tokenizer)
     }
@@ -66,10 +66,10 @@ impl UnigramTokenizer {
         // 添加所有字节值
         for i in 0..=255 {
             let byte_str = format!("<0x{:02X}>", i);
-            let _byte_vec = vec![i as u8];
+            let _byte_vec = [i];
 
             // 将字节向量转换为字符串表示
-            let token = if i >= 32 && i <= 126 {
+            let token = if (32..=126).contains(&i) {
                 // 可打印ASCII字符
                 char::from(i).to_string()
             } else {
@@ -88,11 +88,14 @@ impl UnigramTokenizer {
     }
 
     /// 加载常用汉字
-    fn load_common_chinese_chars(&mut self) -> Result<(), String> {
+    ///
+    /// # 参数
+    /// - `file_path`: 汉字字表文件路径，默认为 "dict/常用汉字字表.txt"
+    fn load_common_chinese_chars(&mut self, file_path: Option<&str>) -> Result<(), String> {
         use std::fs::File;
         use std::io::{BufRead, BufReader};
 
-        let file_path = "dict/常用汉字字表.txt";
+        let file_path = file_path.unwrap_or("dict/常用汉字字表.txt");
         let file = File::open(file_path).map_err(|e| format!("无法打开常用汉字文件: {}", e))?;
 
         let reader = BufReader::new(file);
@@ -193,7 +196,7 @@ impl UnigramTokenizer {
     fn bytes_to_string(&self, bytes: &[u8]) -> String {
         let mut result = String::new();
         for &byte in bytes {
-            if byte >= 32 && byte <= 126 {
+            if (32..=126).contains(&byte) {
                 // 可打印ASCII字符
                 result.push(char::from(byte));
             } else {
@@ -243,7 +246,7 @@ impl UnigramTokenizer {
                 };
 
                 let token_len = token_bytes.len();
-                if i + token_len <= n && &bytes[i..i + token_len] == &token_bytes {
+                if i + token_len <= n && bytes[i..i + token_len] == token_bytes {
                     let score_value = self.scores.get(*token_id as usize).copied().unwrap_or(0.0);
                     let score = dp[i].0 + score_value;
                     if score > dp[i + token_len].0 {
@@ -445,26 +448,25 @@ impl SubwordTokenizer for UnigramTokenizer {
 impl UnigramTokenizer {
     #[new]
     fn new() -> PyResult<Self> {
-        Self::new_internal().map_err(|e| PyValueError::new_err(e))
+        Self::new_internal().map_err(PyValueError::new_err)
     }
 
     #[staticmethod]
     fn with_pattern(pattern: String) -> PyResult<Self> {
-        let tokenizer =
-            Self::with_pattern_internal(pattern).map_err(|e| PyValueError::new_err(e))?;
+        let tokenizer = Self::with_pattern_internal(pattern).map_err(PyValueError::new_err)?;
         Ok(tokenizer)
     }
 
     fn encode(&self, text: &str) -> PyResult<Vec<u32>> {
-        Tokenizer::encode(self, text).map_err(|e| PyValueError::new_err(e))
+        Tokenizer::encode(self, text).map_err(PyValueError::new_err)
     }
 
     fn decode(&self, tokens: Vec<u32>) -> PyResult<String> {
-        Tokenizer::decode(self, &tokens).map_err(|e| PyValueError::new_err(e))
+        Tokenizer::decode(self, &tokens).map_err(PyValueError::new_err)
     }
 
     fn train(&mut self, texts: Vec<String>, vocab_size: u32) -> PyResult<()> {
-        Tokenizer::train(self, texts, vocab_size).map_err(|e| PyValueError::new_err(e))
+        Tokenizer::train(self, texts, vocab_size).map_err(PyValueError::new_err)
     }
 
     fn vocab_size(&self) -> PyResult<usize> {
@@ -472,11 +474,11 @@ impl UnigramTokenizer {
     }
 
     fn save(&self, path: &str) -> PyResult<()> {
-        Tokenizer::save(self, path).map_err(|e| PyValueError::new_err(e))
+        Tokenizer::save(self, path).map_err(PyValueError::new_err)
     }
 
     fn load(&mut self, path: &str) -> PyResult<()> {
-        Tokenizer::load(self, path).map_err(|e| PyValueError::new_err(e))
+        Tokenizer::load(self, path).map_err(PyValueError::new_err)
     }
 
     fn get_scores(&self) -> PyResult<Vec<f64>> {
@@ -499,6 +501,9 @@ impl UnigramTokenizer {
 
 impl Default for UnigramTokenizer {
     fn default() -> Self {
-        Self::new_internal().unwrap()
+        Self::new_internal().expect(
+            "Default Unigram Tokenizer initialization failed. \
+             This is a programming error - please report this bug.",
+        )
     }
 }

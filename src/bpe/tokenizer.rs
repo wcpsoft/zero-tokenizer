@@ -152,7 +152,7 @@ impl Tokenizer {
 
         // 然后添加合并规则的映射
         for (pair, &new_id) in &self.merges {
-            ranks.insert(pair.clone(), new_id);
+            ranks.insert(*pair, new_id);
         }
 
         ranks
@@ -174,7 +174,7 @@ impl Tokenizer {
                 while i < word.ids().len() - 1 {
                     if word.ids()[i] == pair.0 && word.ids()[i + 1] == pair.1 {
                         // 执行合并
-                        word.merge_pair(pair.clone(), new_id, |a, b| a == b);
+                        word.merge_pair(*pair, new_id, |a, b| a == b);
                         changed = true;
                         break;
                     }
@@ -246,7 +246,7 @@ impl Tokenizer {
             // 执行合并
             let new_id = self.next_token_id;
             self.next_token_id += 1;
-            self.merges.insert(top.pair.clone(), new_id);
+            self.merges.insert(top.pair, new_id);
 
             // 更新词汇表
             if let (Some(a_text), Some(b_text)) = (
@@ -263,16 +263,16 @@ impl Tokenizer {
             let mut updated_where: AHashMap<(WordId, WordId), AHashSet<usize>> = AHashMap::new();
 
             for &word_idx in &top.pos {
-                let deltas = words[word_idx].merge_pair(top.pair.clone(), new_id, |a, b| a == b);
+                let deltas = words[word_idx].merge_pair(top.pair, new_id, |a, b| a == b);
                 for (pair, delta) in deltas {
-                    *updated_pairs.entry(pair.clone()).or_insert(0) += delta;
+                    *updated_pairs.entry(pair).or_insert(0) += delta;
                     updated_where.entry(pair).or_default().insert(word_idx);
                 }
             }
 
             // 更新全局计数
             for (pair, delta) in updated_pairs {
-                let entry = pair_counts.entry(pair.clone()).or_insert(0);
+                let entry = pair_counts.entry(pair).or_insert(0);
                 *entry += delta;
 
                 if *entry <= 0 {
@@ -308,13 +308,13 @@ impl Tokenizer {
     /// 创建新的BPE分词器
     #[new]
     pub fn new() -> PyResult<Self> {
-        Self::_new_internal().map_err(|e| PyValueError::new_err(e))
+        Self::_new_internal().map_err(PyValueError::new_err)
     }
 
     /// 使用自定义正则表达式模式创建新的BPE分词器
     #[staticmethod]
     pub fn with_pattern(pattern: String) -> PyResult<Self> {
-        let mut tokenizer = Self::_new_internal().map_err(|e| PyValueError::new_err(e))?;
+        let mut tokenizer = Self::_new_internal().map_err(PyValueError::new_err)?;
         tokenizer.base.pattern = pattern.clone();
         tokenizer.base.compiled_pattern = fancy_regex::Regex::new(&pattern)
             .map_err(|e| PyValueError::new_err(format!("无效的正则表达式: {}", e)))?;
@@ -373,7 +373,7 @@ impl Tokenizer {
 
     /// 训练分词器
     pub fn train(&mut self, texts: Vec<String>, vocab_size: u32) -> PyResult<()> {
-        TokenizerTrait::train(self, texts, vocab_size).map_err(|e| PyValueError::new_err(e))
+        TokenizerTrait::train(self, texts, vocab_size).map_err(PyValueError::new_err)
     }
 
     /// 获取词汇表大小
@@ -395,10 +395,7 @@ impl Tokenizer {
     /// 获取合并等级映射
     pub fn get_mergeable_ranks(&self) -> std::collections::HashMap<(u32, u32), u32> {
         // 转换合并等级映射类型
-        self._get_mergeable_ranks_internal()
-            .into_iter()
-            .map(|((a, b), c)| ((a, b), c))
-            .collect()
+        self._get_mergeable_ranks_internal().into_iter().collect()
     }
 
     /// 保存分词器
@@ -409,7 +406,7 @@ impl Tokenizer {
 
     /// 加载分词器
     pub fn load(&mut self, path: &str) -> PyResult<()> {
-        TokenizerTrait::load(self, path).map_err(|e| PyValueError::new_err(e))
+        TokenizerTrait::load(self, path).map_err(PyValueError::new_err)
     }
 
     /// 从常用汉字字表文件加载基础字符
@@ -464,17 +461,13 @@ impl Tokenizer {
             }
         })?;
 
-        // 准备一个真正的Python迭代器对象
-        let py_iter: pyo3::Py<pyo3::PyAny> = unsafe {
-            pyo3::Bound::from_borrowed_ptr_or_err(
-                py,
-                pyo3::ffi::PyObject_GetIter(iterator.as_ptr()),
-            )
+        // 准备一个真正的Python迭代器对象 (使用安全的PyO3 API)
+        let py_iter: pyo3::Py<pyo3::PyAny> = iterator
+            .try_iter()
             .map_err(|e| crate::error::TokenizerError::InvalidIterator {
                 message: e.to_string(),
             })?
-            .into()
-        };
+            .into();
 
         // 全局块计数
         let mut counts: AHashMap<CompactString, i32> = AHashMap::new();
@@ -497,12 +490,9 @@ impl Tokenizer {
                     if buf.len() >= buffer_size {
                         return Ok(false);
                     }
-                    // next(it)
-                    let next_obj = unsafe {
-                        pyo3::Bound::from_owned_ptr_or_opt(py, pyo3::ffi::PyIter_Next(it.as_ptr()))
-                    };
-                    match next_obj {
-                        Some(obj) => {
+                    // next(it) - 使用安全的PyO3 API
+                    match it.call_method0("__next__") {
+                        Ok(obj) => {
                             let s: String = obj.extract().map_err(|e| {
                                 crate::error::TokenizerError::InvalidInput {
                                     message: e.to_string(),
@@ -510,11 +500,13 @@ impl Tokenizer {
                             })?;
                             buf.push(s);
                         }
-                        None => {
-                            if pyo3::PyErr::occurred(py) {
-                                return Err(pyo3::PyErr::fetch(py).into());
-                            } else {
+                        Err(e) => {
+                            // 检查是否是StopIteration（正常结束）
+                            if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
                                 return Ok(true); // exhausted
+                            } else {
+                                // 其他错误
+                                return Err(e);
                             }
                         }
                     }
@@ -545,15 +537,12 @@ impl Tokenizer {
                         }
                         m
                     })
-                    .reduce(
-                        || AHashMap::new(),
-                        |mut a, b| {
-                            for (k, v) in b {
-                                *a.entry(k).or_default() += v;
-                            }
-                            a
-                        },
-                    )
+                    .reduce(AHashMap::new, |mut a, b| {
+                        for (k, v) in b {
+                            *a.entry(k).or_default() += v;
+                        }
+                        a
+                    })
             });
 
             // 合并局部到全局（单线程）
@@ -761,7 +750,10 @@ impl Tokenizer {
 #[cfg(feature = "python")]
 impl Default for Tokenizer {
     fn default() -> Self {
-        Self::_new_internal().unwrap()
+        Self::_new_internal().expect(
+            "Default BPE Tokenizer initialization failed. \
+             This is a programming error - please report this bug.",
+        )
     }
 }
 
@@ -860,7 +852,6 @@ impl TokenizerTrait for Tokenizer {
         use std::io::Write;
 
         let mut file = OpenOptions::new()
-            .write(true)
             .append(true)
             .open(path)
             .map_err(|e| format!("打开文件失败: {}", e))?;
@@ -936,21 +927,19 @@ impl TokenizerTrait for Tokenizer {
                         self.vocab.insert(id, text);
                     }
                 }
-            } else if line.starts_with("merge: ") {
-                if in_merges {
-                    let parts: Vec<&str> = line[6..].split_whitespace().collect();
-                    if parts.len() == 3 {
-                        let a = parts[0]
-                            .parse::<WordId>()
-                            .map_err(|e| format!("解析合并规则a失败: {}", e))?;
-                        let b = parts[1]
-                            .parse::<WordId>()
-                            .map_err(|e| format!("解析合并规则b失败: {}", e))?;
-                        let new_id = parts[2]
-                            .parse::<WordId>()
-                            .map_err(|e| format!("解析合并规则new_id失败: {}", e))?;
-                        self.merges.insert((a, b), new_id);
-                    }
+            } else if line.starts_with("merge: ") && in_merges {
+                let parts: Vec<&str> = line[6..].split_whitespace().collect();
+                if parts.len() == 3 {
+                    let a = parts[0]
+                        .parse::<WordId>()
+                        .map_err(|e| format!("解析合并规则a失败: {}", e))?;
+                    let b = parts[1]
+                        .parse::<WordId>()
+                        .map_err(|e| format!("解析合并规则b失败: {}", e))?;
+                    let new_id = parts[2]
+                        .parse::<WordId>()
+                        .map_err(|e| format!("解析合并规则new_id失败: {}", e))?;
+                    self.merges.insert((a, b), new_id);
                 }
             }
         }

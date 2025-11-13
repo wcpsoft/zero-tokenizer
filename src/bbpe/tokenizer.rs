@@ -173,7 +173,7 @@ impl BBPETokenizer {
         mut words: Vec<Word<u32>>,
         counts: Vec<i32>,
         vocab_size: u32,
-    ) {
+    ) -> Result<(), String> {
         let num_merges = vocab_size - self.vocab.len() as u32;
         log::info!("开始增量BBPE训练: 需要计算 {} 次合并", num_merges);
         self.merges.clear();
@@ -225,8 +225,16 @@ impl BBPETokenizer {
 
                 // 创建新标记
                 let new_token_bytes = {
-                    let mut new_token_bytes = self.vocab.get_by_id(&top.pair.0).unwrap().clone();
-                    new_token_bytes.extend(self.vocab.get_by_id(&top.pair.1).unwrap());
+                    let first = self
+                        .vocab
+                        .get_by_id(&top.pair.0)
+                        .ok_or_else(|| format!("词汇表中缺少token ID: {}", top.pair.0))?;
+                    let second = self
+                        .vocab
+                        .get_by_id(&top.pair.1)
+                        .ok_or_else(|| format!("词汇表中缺少token ID: {}", top.pair.1))?;
+                    let mut new_token_bytes = first.clone();
+                    new_token_bytes.extend(second);
                     new_token_bytes
                 };
                 self.vocab.insert(new_id, new_token_bytes);
@@ -237,8 +245,7 @@ impl BBPETokenizer {
                     let mut updated_where: AHashMap<(u32, u32), AHashSet<usize>> = AHashMap::new();
 
                     for &word_idx in &top.pos {
-                        let deltas =
-                            words[word_idx].merge_pair(top.pair.clone(), new_id, |a, b| a == b);
+                        let deltas = words[word_idx].merge_pair(top.pair, new_id, |a, b| a == b);
                         for (pair, delta) in deltas {
                             *updated_pairs.entry(pair).or_insert(0) += delta * counts[word_idx];
                             updated_where.entry(pair).or_default().insert(word_idx);
@@ -272,6 +279,7 @@ impl BBPETokenizer {
             }
             merges_done
         };
+        Ok(())
     }
 
     /// 初始化词汇表
@@ -304,7 +312,10 @@ impl BBPETokenizer {
 
 impl Default for BBPETokenizer {
     fn default() -> Self {
-        Self::new_internal().unwrap()
+        Self::new_internal().expect(
+            "Default BBPE Tokenizer initialization failed. \
+             This is a programming error - please report this bug.",
+        )
     }
 }
 
@@ -623,7 +634,7 @@ impl Tokenizer for BBPETokenizer {
         };
 
         // 使用增量训练核心
-        self.train_core_incremental(words, counts, vocab_size);
+        self.train_core_incremental(words, counts, vocab_size)?;
         log::info!("BBPE训练完成，最终词汇表大小: {}", self.vocab.len());
 
         Ok(())
@@ -642,7 +653,6 @@ impl Tokenizer for BBPETokenizer {
         use std::io::Write;
 
         let mut file = OpenOptions::new()
-            .write(true)
             .append(true)
             .open(path)
             .map_err(|e| format!("打开文件失败: {}", e))?;
@@ -725,26 +735,29 @@ impl Tokenizer for BBPETokenizer {
                 continue;
             } else if line.starts_with("base_char: ") {
                 if in_base_chars {
-                    let char_str = line[11..].to_string();
-                    self.base_chars.insert(char_str.as_bytes().to_vec());
+                    if let Some(char_str) = line.strip_prefix("base_char: ") {
+                        self.base_chars.insert(char_str.as_bytes().to_vec());
+                    }
                 }
             } else if line.starts_with("vocab_entry: ") {
                 if in_vocab {
-                    let parts: Vec<&str> = line[12..].split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        let id = parts[0]
-                            .parse::<u32>()
-                            .map_err(|e| format!("解析词汇表ID失败: {}", e))?;
-                        let bytes: Result<Vec<u8>, _> =
-                            parts[1..].iter().map(|s| s.parse::<u8>()).collect();
-                        let bytes = bytes.map_err(|e| format!("解析字节失败: {}", e))?;
+                    if let Some(entry_data) = line.strip_prefix("vocab_entry: ") {
+                        let parts: Vec<&str> = entry_data.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let id = parts[0]
+                                .parse::<u32>()
+                                .map_err(|e| format!("解析词汇表ID失败: {}", e))?;
+                            let bytes: Result<Vec<u8>, _> =
+                                parts[1..].iter().map(|s| s.parse::<u8>()).collect();
+                            let bytes = bytes.map_err(|e| format!("解析字节失败: {}", e))?;
 
-                        self.vocab.insert(id, bytes);
+                            self.vocab.insert(id, bytes);
+                        }
                     }
                 }
-            } else if line.starts_with("merge: ") {
-                if in_merges {
-                    let parts: Vec<&str> = line[6..].split_whitespace().collect();
+            } else if line.starts_with("merge: ") && in_merges {
+                if let Some(merge_data) = line.strip_prefix("merge: ") {
+                    let parts: Vec<&str> = merge_data.split_whitespace().collect();
                     if parts.len() == 3 {
                         let a = parts[0]
                             .parse::<u32>()
