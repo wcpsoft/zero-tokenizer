@@ -61,7 +61,6 @@ impl WordPieceTokenizer {
     fn init_byte_vocab(&mut self) {
         // 清空现有词汇表
         self.base.vocab.clear();
-        self.base.vocab_rev.clear();
         self.scores.clear();
 
         // 添加所有字节值
@@ -78,8 +77,7 @@ impl WordPieceTokenizer {
                 byte_str
             };
 
-            self.base.vocab.insert(token.clone(), i as u32);
-            self.base.vocab_rev.insert(i as u32, token);
+            self.base.vocab.insert(i as u32, token);
             self.scores.push(0.0); // 初始分数为0
         }
 
@@ -105,8 +103,7 @@ impl WordPieceTokenizer {
             if !char_str.is_empty() {
                 // 将汉字添加到词汇表
                 let token_id = self.base.vocab.len() as u32;
-                self.base.vocab.insert(char_str.to_string(), token_id);
-                self.base.vocab_rev.insert(token_id, char_str.to_string());
+                self.base.vocab.insert(token_id, char_str.to_string());
                 self.scores.push(0.0); // 初始分数为0
             }
         }
@@ -127,21 +124,19 @@ impl WordPieceTokenizer {
         let reader = BufReader::new(file);
 
         // 清除256以上的条目，保留基础字节词汇表
-        let keys_to_remove: Vec<String> = self
+        let ids_to_remove: Vec<u32> = self
             .base
-            .vocab_rev
-            .iter()
-            .filter(|(&id, _)| id >= 256)
-            .map(|(_, token)| token.clone())
+            .vocab
+            .ids()
+            .filter(|&&id| id >= 256)
+            .copied()
             .collect();
 
-        for key in keys_to_remove {
-            if let Some(id) = self.base.vocab.remove(&key) {
-                self.base.vocab_rev.remove(&id);
-                // 如果分数数组足够大，也移除对应的分数
-                if id < self.scores.len() as u32 {
-                    self.scores.remove(id as usize);
-                }
+        for id in ids_to_remove {
+            self.base.vocab.remove_by_id(&id);
+            // 如果分数数组足够大，也移除对应的分数
+            if id < self.scores.len() as u32 {
+                self.scores.remove(id as usize);
             }
         }
 
@@ -151,13 +146,8 @@ impl WordPieceTokenizer {
             let token = line.trim();
             if !token.is_empty() {
                 // 检查token是否已存在
-                if !self.base.vocab.contains_key(token) {
-                    self.base
-                        .vocab
-                        .insert(token.to_string(), self.next_token_id);
-                    self.base
-                        .vocab_rev
-                        .insert(self.next_token_id, token.to_string());
+                if !self.base.vocab.contains_value(&token.to_string()) {
+                    self.base.vocab.insert(self.next_token_id, token.to_string());
                     self.scores.push(0.0); // 初始分数为0
                     self.next_token_id += 1;
                 }
@@ -227,7 +217,7 @@ impl WordPieceTokenizer {
             let mut longest_len = 0;
 
             // 尝试所有可能的标记
-            for (token_str, token_id) in &self.base.vocab {
+            for (token_id, token_str) in self.base.vocab.iter() {
                 // 将token字符串转换回字节序列
                 let token_bytes = if token_str.starts_with("<0x") && token_str.ends_with(">") {
                     // 特殊字节表示
@@ -292,7 +282,7 @@ impl Tokenizer for WordPieceTokenizer {
     fn decode(&self, tokens: &[Self::TokenId]) -> Result<String, String> {
         let mut bytes = Vec::new();
         for &token_id in tokens {
-            if let Some(token_str) = self.base.vocab_rev.get(&token_id) {
+            if let Some(token_str) = self.base.vocab.get_by_id(&token_id) {
                 // 将token字符串转换回字节序列
                 if token_str.starts_with("<0x") && token_str.ends_with(">") {
                     // 特殊字节表示
@@ -341,8 +331,7 @@ impl Tokenizer for WordPieceTokenizer {
             }
 
             let token_str = self.bytes_to_string(&substring);
-            self.base.vocab.insert(token_str.clone(), next_id);
-            self.base.vocab_rev.insert(next_id, token_str);
+            self.base.vocab.insert(next_id, token_str);
             self.scores.push(0.0); // 初始分数为0
             next_id += 1;
         }
@@ -357,8 +346,7 @@ impl Tokenizer for WordPieceTokenizer {
             }
 
             let token_str = self.bytes_to_string(&substring);
-            self.base.vocab.insert(token_str.clone(), next_id);
-            self.base.vocab_rev.insert(next_id, token_str);
+            self.base.vocab.insert(next_id, token_str);
             self.scores.push(0.0); // 初始分数为0
             next_id += 1;
         }

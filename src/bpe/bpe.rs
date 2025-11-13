@@ -22,6 +22,8 @@ use crate::base::tokenizer_base::{count_pairs_parallel, TokenizerBase, GPT4_PATT
 #[cfg(feature = "python")]
 use crate::base::traits::{MergeBasedTokenizer, Tokenizer as TokenizerTrait};
 #[cfg(feature = "python")]
+use crate::base::vocab_manager::VocabManager;
+#[cfg(feature = "python")]
 use crate::base::word::Word;
 
 /// 词ID类型
@@ -36,10 +38,8 @@ pub struct Tokenizer {
     pub merges: StdHashMap<(WordId, WordId), WordId>,
     /// 基础分词器，用于文本分割和基础功能
     pub base: TokenizerBase<u32>,
-    /// 词汇表，映射token_id到文本
-    pub vocab: StdHashMap<WordId, String>,
-    /// 反向词汇表，映射文本到token_id（性能优化：O(1)查找）
-    pub vocab_str_to_id: StdHashMap<String, WordId>,
+    /// 词汇表管理器（管理 ID <-> String 的双向映射）
+    pub vocab: VocabManager<WordId, String>,
     /// 下一个可用的token ID
     pub next_token_id: WordId,
 }
@@ -53,8 +53,7 @@ impl Tokenizer {
         let tokenizer = Self {
             merges: StdHashMap::new(),
             base,
-            vocab: StdHashMap::new(),
-            vocab_str_to_id: StdHashMap::new(),
+            vocab: VocabManager::new(),
             next_token_id: 0, // 从0开始，训练时动态分配
         };
 
@@ -69,8 +68,7 @@ impl Tokenizer {
         let tokenizer = Self {
             merges: StdHashMap::new(),
             base,
-            vocab: StdHashMap::new(),
-            vocab_str_to_id: StdHashMap::new(),
+            vocab: VocabManager::new(),
             next_token_id: 0, // 从0开始，训练时动态分配
         };
 
@@ -87,14 +85,12 @@ impl Tokenizer {
         let reader = io::BufReader::new(file);
 
         // 清除现有词汇表中256以上的条目
-        self.vocab.retain(|&k, v| {
-            if k < 256 {
-                true
-            } else {
-                self.vocab_str_to_id.remove(v);
-                false
-            }
-        });
+        let ids_to_remove: Vec<WordId> =
+            self.vocab.ids().filter(|&&id| id >= 256).copied().collect();
+
+        for id in ids_to_remove {
+            self.vocab.remove_by_id(&id);
+        }
         self.next_token_id = 256;
 
         for line in reader.lines() {
@@ -102,7 +98,6 @@ impl Tokenizer {
             let char_str = line.trim();
             if !char_str.is_empty() {
                 self.vocab.insert(self.next_token_id, char_str.to_string());
-                self.vocab_str_to_id.insert(char_str.to_string(), self.next_token_id);
                 self.next_token_id += 1;
             }
         }
@@ -122,14 +117,12 @@ impl Tokenizer {
         let reader = io::BufReader::new(file);
 
         // 清除现有词汇表中256以上的条目
-        self.vocab.retain(|&k, v| {
-            if k < 256 {
-                true
-            } else {
-                self.vocab_str_to_id.remove(v);
-                false
-            }
-        });
+        let ids_to_remove: Vec<WordId> =
+            self.vocab.ids().filter(|&&id| id >= 256).copied().collect();
+
+        for id in ids_to_remove {
+            self.vocab.remove_by_id(&id);
+        }
         self.next_token_id = 256;
 
         for line in reader.lines() {
@@ -139,9 +132,8 @@ impl Tokenizer {
                 continue;
             }
 
-            // 添加新词汇到词汇表，同时更新反向映射
+            // 添加新词汇到词汇表
             self.vocab.insert(self.next_token_id, token.to_string());
-            self.vocab_str_to_id.insert(token.to_string(), self.next_token_id);
             self.next_token_id += 1;
         }
 
@@ -256,14 +248,14 @@ impl Tokenizer {
             self.next_token_id += 1;
             self.merges.insert(top.pair.clone(), new_id);
 
-            // 更新词汇表，同时更新反向映射
-            if let (Some(a_text), Some(b_text)) =
-                (self.vocab.get(&top.pair.0), self.vocab.get(&top.pair.1))
-            {
+            // 更新词汇表
+            if let (Some(a_text), Some(b_text)) = (
+                self.vocab.get_by_id(&top.pair.0),
+                self.vocab.get_by_id(&top.pair.1),
+            ) {
                 // 直接合并文本，不进行字节转换
                 let merged_text = format!("{}{}", a_text, b_text);
                 self.vocab.insert(new_id, merged_text.clone());
-                self.vocab_str_to_id.insert(merged_text, new_id);
             }
 
             // 更新受影响的词
@@ -301,7 +293,6 @@ impl Tokenizer {
                 last_log_percent = percent;
             }
         }
-
 
         log::info!(
             "训练完成，词汇表大小: {}, next_token_id: {}",
@@ -590,7 +581,7 @@ impl Tokenizer {
                 // 直接使用字符的Unicode码点作为token ID
                 let code_point = ch as u32;
                 // 确保字符在词汇表中
-                if !self.vocab.contains_key(&code_point) {
+                if !self.vocab.contains_id(&code_point) {
                     self.vocab.insert(code_point, ch.to_string());
                     if code_point >= self.next_token_id {
                         self.next_token_id = code_point + 1;
@@ -630,7 +621,7 @@ impl Tokenizer {
     /// 获取词汇表
     #[cfg(feature = "python")]
     pub fn _get_vocab(&self) -> StdHashMap<WordId, String> {
-        self.vocab.clone()
+        self.vocab.id_map().clone()
     }
 
     /// 将文本编码为token IDs
@@ -677,7 +668,8 @@ impl Tokenizer {
             }
 
             // 首先尝试直接匹配整个片段 - O(1)查找
-            if let Some(&id) = self.vocab_str_to_id.get(piece) {
+            let piece_string = piece.to_string();
+            if let Some(&id) = self.vocab.get_by_value(&piece_string) {
                 result.push(id);
                 continue;
             }
@@ -687,7 +679,7 @@ impl Tokenizer {
             for ch in piece.chars() {
                 let ch_str = ch.to_string();
                 // 使用反向映射进行O(1)查找
-                if let Some(&id) = self.vocab_str_to_id.get(&ch_str) {
+                if let Some(&id) = self.vocab.get_by_value(&ch_str) {
                     ids.push(id);
                 } else {
                     // 如果找不到，使用字符的Unicode码点作为token ID
@@ -721,7 +713,9 @@ impl Tokenizer {
                 let mut i = 0;
 
                 while i < ids.len() {
-                    if next_merge_idx < merges_to_apply.len() && merges_to_apply[next_merge_idx].0 == i {
+                    if next_merge_idx < merges_to_apply.len()
+                        && merges_to_apply[next_merge_idx].0 == i
+                    {
                         // 这个位置需要合并
                         new_ids.push(merges_to_apply[next_merge_idx].1);
                         i += 2; // 跳过被合并的两个token
@@ -746,7 +740,7 @@ impl Tokenizer {
         let mut result = String::new();
 
         for token in tokens {
-            if let Some(text) = self.vocab.get(&token) {
+            if let Some(text) = self.vocab.get_by_id(&token) {
                 // 直接使用词汇表中的文本
                 result.push_str(text);
             } else {
@@ -815,11 +809,10 @@ impl TokenizerTrait for Tokenizer {
                     for ch in part.chars() {
                         // 直接使用字符的Unicode码点作为token ID
                         let code_point = ch as u32;
-                        // 确保字符在词汇表中，同时维护反向映射
-                        if !self.vocab.contains_key(&code_point) {
+                        // 确保字符在词汇表中
+                        if !self.vocab.contains_id(&code_point) {
                             let ch_str = ch.to_string();
-                            self.vocab.insert(code_point, ch_str.clone());
-                            self.vocab_str_to_id.insert(ch_str, code_point);
+                            self.vocab.insert(code_point, ch_str);
                             if code_point >= self.next_token_id {
                                 self.next_token_id = code_point + 1;
                             }
@@ -876,7 +869,7 @@ impl TokenizerTrait for Tokenizer {
         writeln!(file, "vocab: {}", self.vocab.len())
             .map_err(|e| format!("写入词汇表大小失败: {}", e))?;
 
-        for (&id, text) in &self.vocab {
+        for (&id, text) in self.vocab.iter() {
             writeln!(file, "vocab_entry: {} {}", id, text)
                 .map_err(|e| format!("写入词汇表条目失败: {}", e))?;
         }
@@ -914,7 +907,6 @@ impl TokenizerTrait for Tokenizer {
 
         // 清空当前数据
         self.vocab.clear();
-        self.vocab_str_to_id.clear();
         self.merges.clear();
 
         for line in lines {
@@ -941,8 +933,7 @@ impl TokenizerTrait for Tokenizer {
                             .parse::<WordId>()
                             .map_err(|e| format!("解析词汇表ID失败: {}", e))?;
                         let text = parts[1].to_string();
-                        self.vocab.insert(id, text.clone());
-                        self.vocab_str_to_id.insert(text, id);
+                        self.vocab.insert(id, text);
                     }
                 }
             } else if line.starts_with("merge: ") {

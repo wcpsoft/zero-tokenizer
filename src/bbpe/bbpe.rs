@@ -13,6 +13,7 @@ use rayon::prelude::*;
 use crate::base::merge_job::MergeJob;
 use crate::base::tokenizer_base::{count_pairs_parallel, TokenizerBase};
 use crate::base::traits::{MergeBasedTokenizer, Tokenizer};
+use crate::base::vocab_manager::VocabManager;
 use crate::base::word::Word;
 
 /// BBPE (字节级BPE) 分词器
@@ -21,10 +22,8 @@ use crate::base::word::Word;
 pub struct BBPETokenizer {
     /// 合并规则
     pub merges: StdHashMap<(u32, u32), u32>,
-    /// 词汇表
-    pub vocab: StdHashMap<u32, Vec<u8>>,
-    /// 反向词汇表
-    pub vocab_rev: StdHashMap<Vec<u8>, u32>,
+    /// 词汇表管理器（管理 ID <-> Vec<u8> 的双向映射）
+    pub vocab: VocabManager<u32, Vec<u8>>,
     /// 基础分词器
     pub base: TokenizerBase<u32>,
     /// 基础字符集合（用于初始化词汇表）
@@ -40,8 +39,7 @@ impl BBPETokenizer {
 
         let mut tokenizer = Self {
             merges: StdHashMap::new(),
-            vocab: StdHashMap::new(),
-            vocab_rev: StdHashMap::new(),
+            vocab: VocabManager::new(),
             base,
             base_chars: AHashSet::new(),
             next_token_id: 0,
@@ -59,8 +57,7 @@ impl BBPETokenizer {
 
         let mut tokenizer = Self {
             merges: StdHashMap::new(),
-            vocab: StdHashMap::new(),
-            vocab_rev: StdHashMap::new(),
+            vocab: VocabManager::new(),
             base,
             base_chars: AHashSet::new(),
             next_token_id: 0,
@@ -115,8 +112,7 @@ impl BBPETokenizer {
 
             // 添加新词汇到词汇表
             let token_bytes = token.as_bytes().to_vec();
-            self.vocab.insert(self.next_token_id, token_bytes.clone());
-            self.vocab_rev.insert(token_bytes, self.next_token_id);
+            self.vocab.insert(self.next_token_id, token_bytes);
             self.next_token_id += 1;
         }
 
@@ -155,8 +151,7 @@ impl BBPETokenizer {
             let mut i = 0;
 
             while i < ids.len() {
-                if next_merge_idx < merges_to_apply.len()
-                    && merges_to_apply[next_merge_idx].0 == i
+                if next_merge_idx < merges_to_apply.len() && merges_to_apply[next_merge_idx].0 == i
                 {
                     // 这个位置需要合并
                     new_ids.push(merges_to_apply[next_merge_idx].1);
@@ -230,12 +225,11 @@ impl BBPETokenizer {
 
                 // 创建新标记
                 let new_token_bytes = {
-                    let mut new_token_bytes = self.vocab[&top.pair.0].clone();
-                    new_token_bytes.extend(&self.vocab[&top.pair.1]);
+                    let mut new_token_bytes = self.vocab.get_by_id(&top.pair.0).unwrap().clone();
+                    new_token_bytes.extend(self.vocab.get_by_id(&top.pair.1).unwrap());
                     new_token_bytes
                 };
-                self.vocab.insert(new_id, new_token_bytes.clone());
-                self.vocab_rev.insert(new_token_bytes, new_id);
+                self.vocab.insert(new_id, new_token_bytes);
 
                 // 更新受影响的词
                 let (updated_pairs, updated_where) = {
@@ -284,21 +278,18 @@ impl BBPETokenizer {
     fn init_vocab(&mut self) {
         log::info!("初始化词汇表");
         self.vocab.clear();
-        self.vocab_rev.clear();
 
         // 首先添加基础字符（如果有）
         for (i, char_bytes) in self.base_chars.iter().enumerate() {
             self.vocab.insert(i as u32, char_bytes.clone());
-            self.vocab_rev.insert(char_bytes.clone(), i as u32);
         }
 
         // 然后添加所有字节值（从0到255）
         let mut next_id = self.base_chars.len() as u32;
         for byte in 0..=255u8 {
             let byte_vec = vec![byte];
-            if !self.vocab_rev.contains_key(&byte_vec) {
-                self.vocab.insert(next_id, byte_vec.clone());
-                self.vocab_rev.insert(byte_vec, next_id);
+            if !self.vocab.contains_value(&byte_vec) {
+                self.vocab.insert(next_id, byte_vec);
                 next_id += 1;
             }
         }
@@ -424,14 +415,10 @@ impl BBPETokenizer {
     #[pyo3(name = "encode_batch")]
     pub fn py_encode_batch(&self, texts: Vec<String>) -> PyResult<Vec<Vec<u32>>> {
         // 使用rayon并行处理所有文本
-        let results: Result<Vec<Vec<u32>>, String> = texts
-            .par_iter()
-            .map(|text| self.encode(text))
-            .collect();
+        let results: Result<Vec<Vec<u32>>, String> =
+            texts.par_iter().map(|text| self.encode(text)).collect();
 
-        results.map_err(|e| {
-            crate::error::TokenizerError::EncodingError { message: e }.into()
-        })
+        results.map_err(|e| crate::error::TokenizerError::EncodingError { message: e }.into())
     }
 
     /// 批量解码token IDs为文本（并行处理）
@@ -458,14 +445,14 @@ impl BBPETokenizer {
     #[cfg(feature = "python")]
     #[pyo3(name = "get_vocab")]
     pub fn py_get_vocab(&self) -> StdHashMap<u32, Vec<u8>> {
-        self.vocab.clone()
+        self.vocab.id_map().clone()
     }
 
     /// 获取反向词汇表
     #[cfg(feature = "python")]
     #[pyo3(name = "get_vocab_rev")]
     pub fn py_get_vocab_rev(&self) -> StdHashMap<Vec<u8>, u32> {
-        self.vocab_rev.clone()
+        self.vocab.value_map().clone()
     }
 
     /// 获取合并规则
@@ -517,7 +504,7 @@ impl Tokenizer for BBPETokenizer {
             let mut ids: Vec<u32> = Vec::new();
             for &byte in part.as_bytes() {
                 let byte_vec = vec![byte];
-                if let Some(&id) = self.vocab_rev.get(&byte_vec) {
+                if let Some(&id) = self.vocab.get_by_value(&byte_vec) {
                     ids.push(id);
                 } else {
                     // 这种情况不应该发生，因为我们已经初始化了所有可能的字节
@@ -536,7 +523,7 @@ impl Tokenizer for BBPETokenizer {
                 let mut ids: Vec<u32> = Vec::new();
                 for &byte in word.as_bytes() {
                     let byte_vec = vec![byte];
-                    if let Some(&id) = self.vocab_rev.get(&byte_vec) {
+                    if let Some(&id) = self.vocab.get_by_value(&byte_vec) {
                         ids.push(id);
                     } else {
                         // 这种情况不应该发生，因为我们已经初始化了所有可能的字节
@@ -557,7 +544,7 @@ impl Tokenizer for BBPETokenizer {
         let mut bytes = Vec::new();
 
         for &id in tokens {
-            if let Some(token_bytes) = self.vocab.get(&id) {
+            if let Some(token_bytes) = self.vocab.get_by_id(&id) {
                 bytes.extend_from_slice(token_bytes);
             } else {
                 return Err(format!("未找到ID {} 对应的词汇", id));
@@ -598,15 +585,15 @@ impl Tokenizer for BBPETokenizer {
                         continue;
                     }
 
-                    // 将词转换为字节ID - 通过vocab_rev查找每个字节对应的ID
+                    // 将词转换为字节ID - 通过vocab查找每个字节对应的ID
                     let ids: Vec<u32> = part
                         .bytes()
                         .map(|b| {
                             let byte_vec = vec![b];
                             *self
-                                .vocab_rev
-                                .get(&byte_vec)
-                                .unwrap_or_else(|| panic!("字节 {} 在vocab_rev中不存在", b))
+                                .vocab
+                                .get_by_value(&byte_vec)
+                                .unwrap_or_else(|| panic!("字节 {} 在vocab中不存在", b))
                         })
                         .collect();
                     words.push(Word::new(ids));
@@ -622,9 +609,9 @@ impl Tokenizer for BBPETokenizer {
                             .map(|b| {
                                 let byte_vec = vec![b];
                                 *self
-                                    .vocab_rev
-                                    .get(&byte_vec)
-                                    .unwrap_or_else(|| panic!("字节 {} 在vocab_rev中不存在", b))
+                                    .vocab
+                                    .get_by_value(&byte_vec)
+                                    .unwrap_or_else(|| panic!("字节 {} 在vocab中不存在", b))
                             })
                             .collect();
                         words.push(Word::new(ids));
@@ -674,7 +661,7 @@ impl Tokenizer for BBPETokenizer {
         writeln!(file, "vocab: {}", self.vocab.len())
             .map_err(|e| format!("写入词汇表数量失败: {}", e))?;
 
-        for (id, bytes) in &self.vocab {
+        for (id, bytes) in self.vocab.iter() {
             let byte_str = bytes
                 .iter()
                 .map(|b| b.to_string())
@@ -715,7 +702,6 @@ impl Tokenizer for BBPETokenizer {
         // 清空当前数据
         self.base_chars.clear();
         self.vocab.clear();
-        self.vocab_rev.clear();
         self.merges.clear();
 
         for line in lines {
@@ -753,8 +739,7 @@ impl Tokenizer for BBPETokenizer {
                             parts[1..].iter().map(|s| s.parse::<u8>()).collect();
                         let bytes = bytes.map_err(|e| format!("解析字节失败: {}", e))?;
 
-                        self.vocab.insert(id, bytes.clone());
-                        self.vocab_rev.insert(bytes, id);
+                        self.vocab.insert(id, bytes);
                     }
                 }
             } else if line.starts_with("merge: ") {

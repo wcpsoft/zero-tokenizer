@@ -6,6 +6,7 @@ use std::hash::Hash;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 
+use crate::base::vocab_manager::VocabManager;
 use crate::base::word::Word;
 
 /// 默认的GPT-4风格正则表达式模式，用于分割文本
@@ -13,11 +14,12 @@ pub const GPT4_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+
 
 /// 分词器基础实现，提供通用功能
 #[derive(Clone)]
-pub struct TokenizerBase<Id> {
-    /// 词汇表，从标记到ID的映射
-    pub vocab: HashMap<String, Id>,
-    /// 反向词汇表，从ID到标记的映射
-    pub vocab_rev: HashMap<Id, String>,
+pub struct TokenizerBase<Id>
+where
+    Id: Eq + Hash + Clone + std::fmt::Debug,
+{
+    /// 词汇表管理器（管理 ID <-> String 的双向映射）
+    pub vocab: VocabManager<Id, String>,
     /// 正则表达式模式
     pub pattern: String,
     /// 编译后的正则表达式
@@ -34,8 +36,7 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
             Regex::new(&pattern).map_err(|e| format!("无效的正则表达式: {}", e))?;
 
         Ok(Self {
-            vocab: HashMap::new(),
-            vocab_rev: HashMap::new(),
+            vocab: VocabManager::new(),
             pattern,
             compiled_pattern,
         })
@@ -47,8 +48,7 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
             Regex::new(&pattern).map_err(|e| format!("无效的正则表达式: {}", e))?;
 
         Ok(Self {
-            vocab: HashMap::new(),
-            vocab_rev: HashMap::new(),
+            vocab: VocabManager::new(),
             pattern,
             compiled_pattern,
         })
@@ -56,27 +56,26 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
 
     /// 添加标记到词汇表
     pub fn add_token(&mut self, token: &str, id: Id) -> Result<(), String> {
-        if self.vocab.contains_key(token) {
+        if self.vocab.contains_value(&token.to_string()) {
             return Err(format!("标记 '{}' 已存在于词汇表中", token));
         }
 
-        if self.vocab_rev.contains_key(&id) {
+        if self.vocab.contains_id(&id) {
             return Err(format!("ID '{:?}' 已存在于词汇表中", id));
         }
 
-        self.vocab.insert(token.to_string(), id.clone());
-        self.vocab_rev.insert(id, token.to_string());
+        self.vocab.insert(id, token.to_string());
         Ok(())
     }
 
     /// 获取标记的ID
     pub fn get_token_id(&self, token: &str) -> Option<&Id> {
-        self.vocab.get(token)
+        self.vocab.get_by_value(&token.to_string())
     }
 
     /// 获取ID对应的标记
     pub fn get_token(&self, id: &Id) -> Option<&String> {
-        self.vocab_rev.get(id)
+        self.vocab.get_by_id(id)
     }
 
     /// 获取词汇表大小
@@ -119,7 +118,7 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
         writeln!(writer, "vocab_size: {}", self.vocab.len())
             .map_err(|e| format!("写入词汇表大小失败: {}", e))?;
 
-        for (token, id) in &self.vocab {
+        for (id, token) in self.vocab.iter() {
             let id_str = serde_json::to_string(id).map_err(|e| format!("序列化ID失败: {}", e))?;
             writeln!(writer, "{} {}", token, id_str)
                 .map_err(|e| format!("写入词汇表项失败: {}", e))?;
@@ -135,7 +134,6 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
 
         // 清空当前词汇表
         self.vocab.clear();
-        self.vocab_rev.clear();
 
         let mut lines = reader.lines();
 
@@ -165,8 +163,7 @@ impl<Id: Clone + Serialize + for<'de> Deserialize<'de> + Eq + Hash + std::fmt::D
             let id: Id =
                 serde_json::from_str(id_str).map_err(|e| format!("反序列化ID失败: {}", e))?;
 
-            self.vocab.insert(token.to_string(), id.clone());
-            self.vocab_rev.insert(id, token.to_string());
+            self.vocab.insert(id, token.to_string());
         }
 
         Ok(())
